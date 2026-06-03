@@ -1,0 +1,29 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments
+.venv/
+venv/
+.env
+.env.local
+
+# Temporary outputs
+tmp/
+tmp_*/
+tmp_pdf/
+document/
+*.tmp
+*.log
