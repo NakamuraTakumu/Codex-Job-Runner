@@ -1,30 +1,30 @@
 # Codex API Wrapper Spec
 
 - Created: 2026-06-01T09:07:35Z
-- Updated: 2026-06-03T12:00:00Z
+- Updated: 2026-06-04T00:00:00Z
 - Model: GPT-5.5
 - Reasoning-Effort: high
 - Session: current Codex Desktop thread
 - Repository: none
 - Related-Commit: none
 
-Responsibility: skill、workflow、hook、script の設計または実装時に、`codex exec` を Python から job として起動する最小 wrapper の入力、設定、完了検知、出力、失敗時の扱いを定義する。
+Responsibility: skill、workflow、hook、script の設計または実装時に、Codex SDK-backed job を Python から起動する最小 wrapper の入力、設定、完了検知、出力、失敗時の扱いを定義する。
 
 ## Background
 
-ユーザーは、OpenAI API 完全互換ではなく、`codex` command を Python から API 風に呼べる薄い wrapper を求めている。主な利用場面は、skill、workflow、hook、script を設計または実装するときに、別プロセスの Codex job を起動して結果を回収することである。作業場所は `skills/` 直下の `codex-job-runner/` とする。
+ユーザーは、OpenAI API 完全互換ではなく、Codex job を Python から API 風に呼べる薄い wrapper を求めている。主な利用場面は、skill、workflow、hook、script を設計または実装するときに、別プロセス相当の Codex job を起動して結果を回収することである。作業場所は `skills/` 直下の `codex-job-runner/` とする。
 
 ## Result
 
-**Public calls**: `client.start(...)` は non-blocking に job を起動する。`job.done()`, `job.result()`, `job.cancel()`, `client.wait_any(...)` で完了済み job から回収する。`client.run(...)` は `start(...).result()` の convenience method とする。
+**Public calls**: `client.start(...)` は non-blocking に job を起動する。`job.done()`, `job.result()`, `job.cancel()`, `client.wait_any(...)` で完了済み job から回収する。`client.run(...)` は `start(...).result()` の convenience method とする。`client.start_review_session(...)` は reviewer 用の継続会話 session を返し、`ReviewSession.send(...)` と `ReviewSession.close()` を提供する。
 
 **Primary input**: `input` は Codex への依頼文であり、OpenAI Chat Completions の `messages` 形式は使わない。
 
-**Context inputs**: `attachments` は model の初期 context に入れる file または directory path、`read_paths` は追加で読んでよい path、`write_paths` は書いてよい path として分ける。`output_schema_path` を指定した場合、schema file は Codex CLI の structured output 制約として渡し、同時に model の初期 context にも入れる。
+**Context inputs**: `attachments` は model の初期 context に入れる file または directory path、`read_paths` は追加で読んでよい path、`write_paths` は書いてよい path として分ける。`output_schema_path` を指定した場合、schema file は SDK turn の structured output 制約として渡し、同時に model の初期 context にも入れる。
 
 **Execution settings**: `model`, `reasoning_effort`, `cwd`, `timeout`, `ignore_global_context`, `allowed_skills`, `allow_shell_commands` は client default と per-call override の両方で指定できる。filesystem 権限は `read_paths`, `write_paths` から Permission Profile を組み立てて決める。shell command 実行は既定で on にし、Permission Profile の filesystem sandbox に従わせる。
 
-**Output**: 成功時は `CodexResponse.content` を主出力にし、CLI が返した usage は `CodexResponse.usage` に入れる。`CodexResponse.argv` は最終 main attempt の argv、`CodexResponse.activity_log` は wrapper 側 phase log を保持する。失敗時は `CodexExecutionError` または `CodexTimeoutError` を raise し、終了 code、stdout、stderr、argv、activity log を保持する。
+**Output**: 成功時は `CodexResponse.content` を主出力にし、SDK が返した usage は `CodexResponse.usage` に入れる。`CodexResponse.argv` は最終 main attempt の argv、`CodexResponse.activity_log` は wrapper 側 phase log を保持する。失敗時は `CodexExecutionError` または `CodexTimeoutError` を raise し、終了 code、stdout、stderr、argv、activity log を保持する。
 
 **Skill role**: この directory は Codex skill としても使う。`SKILL.md` は使用場面と参照導線、`README.md` は実用 API、`spec.md` は設計契約を担う。
 
@@ -106,6 +106,7 @@ while jobs:
 | `write_paths` | `list[str]` | no | Codex が書いてよい file または directory path。 |
 | `subcwd_files` | `dict[str, dict[str, str \| bytes]]` | no | `${SUBCWD}` workspace に事前配置する file 実体。 |
 | `output_schema_path` | `str` | no | Codex の最終応答 shape を制約し、初期 context にも入れる JSON Schema file path。 |
+| `output_pydantic_model` | `object` | no | `model_json_schema()` / `model_validate_json()` を持つ Pydantic model 相当の class。`output_schema_path` の代わりに使い、wrapper が JSON Schema を生成して SDK に渡す。 |
 | `output_validator` | `str | list[str]` | no | `CodexResponse.content` を検証する command。 |
 | `review` | `ReviewConfig` | no | validator 成功後に追加で走らせる review job の設定。 |
 | `inline_attachments` | `bool | None` | no | `attachments` の通常 file 内容を prompt に入れるか。既定と `None` は `True`。 |
@@ -122,11 +123,19 @@ while jobs:
 
 `subcwd_files`: `${SUBCWD}` 内の相対 POSIX path を key にし、value は `{"text": "..."}` または `{"bytes": b"..."}` とする。`text` を使う場合だけ `encoding` を任意で指定でき、省略時は `utf-8` とする。wrapper は job 開始前に `${SUBCWD}` へ file を書き出し、worker はその file を直接編集してよい。`attachments` と `read_paths` で `${SUBCWD}` を受ける代わりに、wrapper が staged file 一覧を prompt に通知する。
 
-`output_schema_path`: `codex exec --output-schema <file>` に渡す JSON Schema file。`cwd` 相対または absolute path を受け取る。存在しない path は実行前に error にする。schema file の本文は `<OutputSchema path="...">...</OutputSchema>` として prompt の `Output schema` section にも入れる。schema は UTF-8 text の通常 file とし、inline attachment と同じ 1 file byte 上限に従う。schema 内容の validation は Codex CLI 側へ委ね、wrapper は JSON Schema validator を実装しない。
+`output_schema_path`: SDK turn の `output_schema` に渡す JSON Schema file。`cwd` 相対または absolute path を受け取る。存在しない path は実行前に error にする。schema file の本文は `<OutputSchema path="...">...</OutputSchema>` として prompt の `Output schema` section にも入れる。schema は UTF-8 text の通常 file とし、inline attachment と同じ 1 file byte 上限に従う。schema 内容の validation は SDK 側へ委ね、wrapper は JSON Schema validator を実装しない。
 
-`output_validator`: wrapper 側で最終応答を検証する command。`str` は単一 executable、`list[str]` は argv として扱い、shell 文字列としては解釈しない。validator と validation failure repair の詳細は `validation-repair-spec.md` を正本とする。
+`output_pydantic_model`: `model_json_schema()` と `model_validate_json()` を持つ model class を受け取る。wrapper は `model_json_schema()` から一時 JSON Schema file を生成し、`output_schema_path` と同様に SDK turn と prompt context に渡す。wrapper 側 validation では custom `output_validator` の前に `model_validate_json()` を実行する。`output_schema_path` と同時指定した場合は実行前に error にする。
 
-`review`: `ReviewConfig` object。review 関係だけは個別引数を増やさず object にまとめる。review job は validator 成功後にだけ走り、`original_input`、主 job に実際に渡した wrapper prompt 全体、最終応答、`${SUBCWD}` を読んで指示準拠と成果物品質を判定する。review fail 時は `repair_text` を既存 repair prompt に統合する。
+`output_validator`: wrapper 側で最終応答を検証する command。`str` は単一 executable、`list[str]` は argv として扱い、shell 文字列としては解釈しない。`output_pydantic_model` が指定された場合、Pydantic validation 成功後に実行する。validator と validation failure repair の詳細は `validation-repair-spec.md` を正本とする。
+
+`review`: `ReviewConfig` object。review 関係だけは個別引数を増やさず object にまとめる。review は reviewer session の初回 1 turn として validator 成功後にだけ走り、`original_input`、主 job に実際に渡した wrapper prompt 全体、最終応答、`${SUBCWD}` を読んで指示準拠と成果物品質を判定する。review fail 時は `repair_text` を既存 repair prompt に統合する。
+
+### Review Session
+
+`client.start_review_session(...)` は reviewer と継続会話する `ReviewSession` を返す。session は `ReviewConfig.instructions` を reviewer の継続指示として保持し、`ReviewSession.send(message, output_schema_path=None)` で新しい発話を送り、`CodexResponse` を返す。`ReviewSession.close()` は session を閉じる。
+
+reviewer session では同じ `thread` を継続利用し、turn ごとの入力には会話履歴と最新 message を渡す。
 
 ### Execution Settings
 
@@ -134,10 +143,9 @@ while jobs:
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `codex_bin` | `str` | `"codex"` | 実行する Codex CLI command。client default のみ。 |
-| `model` | `str | None` | `"gpt-5.4-mini"` | `codex exec --model <model>` に渡す model 名。 |
-| `reasoning_effort` | `str | None` | `"medium"` | Codex CLI の `model_reasoning_effort` config に渡す thinking / reasoning effort。 |
-| `cwd` | `str | None` | process cwd | `codex exec -C <cwd>` に渡す作業 directory。 |
+| `model` | `str | None` | `"gpt-5.4-mini"` | SDK thread / turn に渡す model 名。 |
+| `reasoning_effort` | `str | None` | `"medium"` | SDK turn の `effort` に渡す thinking / reasoning effort。 |
+| `cwd` | `str | None` | process cwd | SDK job と validator の作業 directory。 |
 | `subcwd_root` | `str | None` | `None` | `${SUBCWD}` を使う job の一時 directory 親 path。client default のみ。未指定時は resolved `cwd` を使う。 |
 | `timeout` | `int | float | None` | `None` | subprocess の最大待ち時間。秒単位。 |
 | `ignore_global_context` | `bool` | `False` | global な config、`AGENTS.md`、skills の影響を避ける best-effort mode。 |
@@ -152,7 +160,7 @@ while jobs:
 
 wrapper の `model` 既定値は `gpt-5.4-mini` である。client または per-call で別値を指定した場合だけ上書きする。Codex CLI または user config の既定値へ委譲したい場合は、`CodexClient(model=None, ...)` のように client default を `None` にする。
 
-`reasoning_effort` は `codex exec -c 'model_reasoning_effort="<value>"'` として渡す。wrapper 既定値は `medium` であり、client または per-call で別値を指定した場合だけ上書きする。Codex CLI または user config の既定値へ委譲したい場合は、`CodexClient(reasoning_effort=None, ...)` のように client default を `None` にする。wrapper は値の enum を固定せず、空文字列だけを実行前に `ValueError` にする。
+`reasoning_effort` は SDK turn の `effort` と config override の両方へ渡す。wrapper 既定値は `medium` であり、client または per-call で別値を指定した場合だけ上書きする。既定値へ委譲したい場合は、`CodexClient(reasoning_effort=None, ...)` のように client default を `None` にする。wrapper は値の enum を固定せず、空文字列だけを実行前に `ValueError` にする。
 
 `subcwd_root` は `${SUBCWD}` を使う job の一時 directory 親 path を指定する client default である。`cwd` 相対または absolute path を受け付けるが、resolved `cwd` 配下でなければならない。`${SUBCWD}` token は受け付けない。`subcwd_root=None` の場合は resolved `cwd` を使う。per-call override は v1 では提供しない。
 
@@ -168,9 +176,8 @@ v1 は command prefix ごとの allowlist / denylist を public API に含めな
 
 `ignore_global_context=True` の場合、wrapper は次の処理を行う。
 
-- `codex exec --ignore-user-config` を付け、`$CODEX_HOME/config.toml` を読ませない。
-- `codex exec -c 'project_doc_max_bytes=0'` を付け、project `AGENTS.md` の prompt 注入を抑える。
-- `allowed_skills` が未指定なら `[]` として扱い、`codex exec -c 'skills.include_instructions=false'` を付ける。
+- SDK config override で `project_doc_max_bytes=0` を渡し、project `AGENTS.md` の prompt 注入を抑える。
+- `allowed_skills` が未指定なら `[]` として扱い、SDK config override で `skills.include_instructions=false` を渡す。
 - prompt に、global `AGENTS.md` と skills を使わず、必要な指示は `attachments` から読むよう明記する。
 - 認証情報と既存 install 状態を保つため、`CODEX_HOME` は差し替えない。
 
@@ -196,7 +203,7 @@ wrapper は `approval_policy` を public API に出さない。非対話 job が
 
 `--ask-for-approval never` は「承認 prompt で停止しない」という指定であり、filesystem や shell command を広く許可する指定ではない。実際の filesystem 境界は Permission Profile で作り、shell command 自体を使わせない job では追加で `features.shell_tool=false` を使う。
 
-command 実行時の file access 権限は Permission Profile で制御する。wrapper は global config を編集せず、job ごとに一意な profile 名を作り、`codex exec -c ...` の inline config override で直接指定する。
+command 実行時の file access 権限は Permission Profile で制御する。wrapper は global config を編集せず、job ごとに一意な profile 名を作り、SDK config override で直接指定する。
 
 | Input | Permission Profile mode |
 | --- | --- |
@@ -222,8 +229,6 @@ codex --ask-for-approval never exec \
 
 `cwd` の外側を指す path は、v1 では実行前に `ValueError` にする。Codex CLI の Permission Profile は direct absolute path rule も持つが、write rule は runtime によって拒否されうるため、この wrapper の最小仕様では扱わない。
 
-`allow_shell_commands=True` の場合、sandbox 内の command runner が起動できるように、wrapper は `codex_bin` から解決した Codex runtime directory を direct absolute read rule として Permission Profile に追加する。この内部 read rule は Codex CLI runtime のためだけに使い、ユーザー指定の `read_paths` / `write_paths` とは別に扱う。
-
 同じ path が `read_paths` と `write_paths` の両方にある場合は `write` として扱う。v1 は whitelist 方式とし、指定されていない path は読まず書かない前提にする。明示的な deny list は public API に含めない。
 
 `ignore_global_context=True` または `allowed_skills=[]` の場合、wrapper は Permission Profile に `$CODEX_HOME/skills` を追加しない。これにより、model が shell command で global skill file を直接読む経路も許可しない方針にする。
@@ -240,7 +245,7 @@ Permission Profile を使えない Codex CLI version では、wrapper は strict
 
 ### Job API
 
-`client.start(...)` は `codex exec` subprocess を起動して、すぐ `CodexJob` を返す。呼び出し側 thread を Codex の完了まで block しない。
+`client.start(...)` は Codex job を起動して、すぐ `CodexJob` を返す。呼び出し側 thread を Codex の完了まで block しない。
 
 `CodexJob` は次を提供する。
 
@@ -265,7 +270,7 @@ def run(...):
 
 ### Completion Detection
 
-wrapper は `codex exec` subprocess の終了を job completion として扱う。
+wrapper は main attempt と validator / review / cleanup を含む job group の終了を job completion として扱う。
 
 - subprocess が終了していない場合、`job.status` は `"running"`。
 - subprocess が exit code `0` で終了した場合、`job.status` は `"completed"`。
@@ -282,14 +287,14 @@ wrapper は stdout の文字列、JSON event、または output file の存在�
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `content` | `str` | Codex の最終応答。通常利用ではこの field だけ読む。 |
-| `returncode` | `int` | `codex exec` の終了 code。成功時は `0`。 |
-| `stdout` | `str` | `codex exec` の stdout。debug 用。 |
-| `stderr` | `str` | `codex exec` の stderr。debug 用。 |
-| `usage` | `dict[str, int] \| None` | `codex exec --json` の `turn.completed.usage`。repair を含む job 全体で合算する。 |
+| `returncode` | `int` | 最終 main attempt の終了 code。成功時は `0`。 |
+| `stdout` | `str` | wrapper が保持した stream event / process stdout。debug 用。 |
+| `stderr` | `str` | main attempt または補助 process の stderr。debug 用。 |
+| `usage` | `dict[str, int] \| None` | SDK の `turn.completed.usage`。repair を含む job 全体で合算する。 |
 
 ### Output Extraction
 
-wrapper は `codex exec --output-last-message <tempfile>` と `--json` を併用して Codex の最終応答と usage を取り出す。`stdout` は進捗、event、warning、JSON event が混ざる可能性があるため、主出力 `content` の source of truth として扱わない。
+wrapper は SDK turn の最終応答と stream event から Codex の最終応答と usage を取り出す。`stdout` は進捗、event、warning、JSON event が混ざる可能性があるため、主出力 `content` の source of truth として扱わない。
 
 `ignore_global_context=True` かつ `allowed_skills=[]` の場合、実行時の概念的な command は次の通り。
 
@@ -307,7 +312,7 @@ codex --ask-for-approval never exec \
   -
 ```
 
-wrapper は prompt を stdin に渡し、`codex exec` 終了後に `<tempfile>` を UTF-8 text として読む。読み取った文字列を `CodexResponse.content` に入れる。同時に stdout の JSON event から `turn.completed.usage` を回収し、`CodexResponse.usage` に入れる。
+wrapper は SDK turn の final response を `CodexResponse.content` に入れる。同時に stream event から `turn.completed.usage` を回収し、`CodexResponse.usage` に入れる。
 
 `CodexResponse.stdout` と `CodexResponse.stderr` は subprocess の captured output をそのまま保持する。これらは debugging と error reporting 用であり、通常の呼び出し側は `content` と必要なら `usage` を読む。
 
@@ -325,7 +330,7 @@ print(response.content)
 
 `output_schema_path` は final response、つまり `CodexResponse.content` に対応する。`subcwd` や `response.files` に回収される file の schema validation は別責務とし、この option では扱わない。
 
-wrapper は schema file を生成しない。schema を別 file として管理し、path と本文を渡す。Python 標準 library だけでは JSON Schema validation を実装しないため、`output_schema_path` 自体では wrapper 側 parse / validate を行わず、機械的な shape 制約は `codex exec --output-schema` に委ねる。
+wrapper は schema file を生成しない。schema を別 file として管理し、path と本文を渡す。Python 標準 library だけでは JSON Schema validation を実装しないため、`output_schema_path` 自体では wrapper 側 parse / validate を行わず、機械的な shape 制約は SDK turn の `output_schema` に委ねる。
 
 wrapper 側 validation が必要な場合は `output_validator` を使う。wrapper は `CodexResponse.content` を validator の stdin に渡し、metadata を environment variable で渡す。validator が non-zero で終了した場合は `CodexValidationError` を raise する。`repair_validation_failures=True` の場合、wrapper は same-model repair attempt を `max_repairs` まで行う。
 
@@ -338,14 +343,14 @@ print(response.content)
 
 ### Failure Output
 
-`codex exec` が失敗した場合は `CodexExecutionError` を raise する。`job.result(timeout=...)` が timeout した場合は `CodexTimeoutError` を raise する。`job.cancel()` 後に `job.result()` を呼んだ場合は `CodexCancelledError` を raise する。
+Codex main attempt が失敗した場合は `CodexExecutionError` を raise する。`job.result(timeout=...)` が timeout した場合は `CodexTimeoutError` を raise する。`job.cancel()` 後に `job.result()` を呼んだ場合は `CodexCancelledError` を raise する。
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `returncode` | `int | None` | subprocess の終了 code。timeout の場合は `None`。 |
 | `stdout` | `str` | 失敗時点の stdout。 |
 | `stderr` | `str` | 失敗時点の stderr。 |
-| `argv` | `list[str]` | 実行した `codex exec` command。 |
+| `argv` | `list[str]` | 実行設定を表す argv 互換 field。SDK backend では `openai-codex thread.run ...` 形式になる。 |
 | `message` | `str` | 人間向けの短い失敗説明。 |
 
 ### Explicitly Out Of Scope

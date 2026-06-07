@@ -1,6 +1,6 @@
 # Codex API Wrapper
 
-`codex_api_wrapper` は、`codex exec` を扱う小さな pure Python wrapper である。
+`codex_api_wrapper` は、`openai-codex` SDK を使って Codex job を扱う小さな pure Python wrapper である。
 Python から Codex job を起動する必要がある skill、workflow、hook、script 作成者向けの補助 library として使う。OpenAI SDK 互換ではなく、最小の job-style API を提供する。
 
 この directory は Codex skill でもある。`SKILL.md` を entrypoint、この README を実用 API reference、`spec.md` を設計契約として扱う。
@@ -32,12 +32,40 @@ for entry in response.activity_log:
 
 ## API
 
-- `CodexClient.start(...)`: `codex exec` を起動し、すぐに返る。
+- `CodexClient.start(...)`: Codex job を起動し、すぐに返る。
 - `CodexClient.run(...)`: `start(...).result(...)` の convenience method。
+- `CodexClient.start_review_session(...)`: reviewer と継続会話できる `ReviewSession` を返す。
 - `CodexClient.wait_any(jobs, timeout=None)`: 最初に完了した job を返す。なければ `None` を返す。
 - `CodexJob.done()`: subprocess が終了済みかを返す。
 - `CodexJob.result(timeout=None)`: `CodexResponse` を返す。失敗時は error を raise する。
 - `CodexJob.cancel()`: subprocess を終了する。
+- `ReviewSession.send(...)`: reviewer へ追加入力を送り、次の返答を得る。
+- `ReviewSession.close()`: reviewer session を閉じる。
+
+## Review Session
+
+```python
+from codex_api_wrapper import CodexClient, ReviewConfig
+
+client = CodexClient(cwd="/home/nakamura/recruit")
+session = client.start_review_session(
+    review=ReviewConfig(
+        instructions="コードレビュー担当として、指摘と補足説明を返してください。",
+    ),
+    read_paths=["src", "README.md"],
+)
+
+try:
+    first = session.send("まずこの差分をレビューしてください。")
+    second = session.send("その 2 点目をもう少し具体的に説明してください。")
+finally:
+    session.close()
+
+print(first.content)
+print(second.content)
+```
+
+`ReviewSession` は reviewer の会話履歴を保持し、同じ thread を継続利用する。
 
 ## 入力
 
@@ -47,6 +75,7 @@ for entry in response.activity_log:
 - `write_paths`: Codex が書いてよい path。
 - `subcwd_files`: `${SUBCWD}` に事前配置する file 実体。
 - `output_schema_path`: 最終応答 shape を指定する JSON Schema file path。
+- `output_pydantic_model`: `model_json_schema()` / `model_validate_json()` を持つ Pydantic model 相当の class。`output_schema_path` の代わりに使い、wrapper はこの model から JSON Schema を生成して SDK に渡す。さらに custom `output_validator` の前に `model_validate_json()` を実行する。
 - `output_validator`: 最終応答を検証する command。
 - `collect_files`: `${SUBCWD}` 配下の通常 file を `response.files` へ回収する。
 
@@ -107,7 +136,7 @@ print(response.files["report.md"].text)
 
 wrapper の既定値は `model="gpt-5.4-mini"` と `reasoning_effort="medium"` である。明示的に別値へ変えたい場合だけ指定する。Codex CLI または user config の既定値へ委譲したい場合は、`CodexClient(model=None, reasoning_effort=None, ...)` のように client default を `None` にする。
 
-`reasoning_effort` は Codex CLI の `model_reasoning_effort` config に渡す。thinking effort を job ごとに変えたい場合に使う。wrapper 既定値は `medium` であり、client または per-call で別値を指定した場合だけ上書きする。
+`reasoning_effort` は SDK turn の `effort` に渡す。thinking effort を job ごとに変えたい場合に使う。wrapper 既定値は `medium` であり、client または per-call で別値を指定した場合だけ上書きする。
 
 `subcwd_root` は `${SUBCWD}` を使う job の一時 directory の親ディレクトリを指定する client default である。`cwd` 相対または absolute path を受け付けるが、正規化後に `cwd` 配下でなければならない。`${SUBCWD}` token は受け付けない。未指定時は `cwd` を使う。
 
@@ -121,7 +150,9 @@ command prefix ごとの allowlist / denylist は v1 API では扱わない。�
 
 `subcwd_files` は `${SUBCWD}` workspace に初期 file を staged する per-call API である。key は `${SUBCWD}` 内の相対 path、value は `{"text": "..."}` または `{"bytes": b"..."}` とする。小さい UTF-8 text でも wrapper は自動 inline せず、prompt には staged file の path 一覧だけを出す。
 
-`output_schema_path` は `codex exec --output-schema <FILE>` に渡す。wrapper は同時に `--json` も渡し、最終応答は output file から、usage は `turn.completed.usage` から回収する。さらに schema file の本文を `Output schema` section として初期 context に入れる。schema は UTF-8 text の通常 file とし、inline attachment と同じ 1 file byte 上限に従う。wrapper は schema validation を自前実装しない。
+`output_schema_path` は SDK turn の `output_schema` に渡す。さらに schema file の本文を `Output schema` section として初期 context に入れる。schema は UTF-8 text の通常 file とし、inline attachment と同じ 1 file byte 上限に従う。wrapper は schema validation を自前実装しない。
+
+`output_pydantic_model` を指定した場合、wrapper は `model_json_schema()` から一時 JSON Schema file を生成し、それを `output_schema_path` と同様に SDK turn と prompt context に渡す。さらに final response に対して `model_validate_json()` を走らせ、失敗した場合は `output_validator` より前に validation failure として扱う。`output_schema_path` と `output_pydantic_model` の同時指定はできない。
 
 `output_validator` は `response.content` を stdin に受け取る command として実行される。引数が必要な場合は shell 文字列ではなく argv list で渡す。
 
@@ -138,9 +169,9 @@ response = client.run(
 )
 ```
 
-validator が non-zero で終了した場合は `CodexValidationError` になる。`repair_validation_failures=True` の場合、wrapper は同じ model と同じ `${SUBCWD}` で repair attempt を行い、成功した最終応答だけを返す。さらに `review=ReviewConfig(...)` を渡すと、validator 成功後に review job を追加実行し、review fail 時も repair prompt に修正指示を流し込む。詳細契約は `validation-repair-spec.md` を参照する。
+validator が non-zero で終了した場合は `CodexValidationError` になる。`repair_validation_failures=True` の場合、wrapper は同じ model と同じ `${SUBCWD}` で repair attempt を行い、成功した最終応答だけを返す。さらに `review=ReviewConfig(...)` を渡すと、validator 成功後に review session を 1 turn 実行し、review fail 時も repair prompt に修正指示を流し込む。詳細契約は `validation-repair-spec.md` を参照する。
 
-`CodexResponse.usage` は `dict[str, int] | None` で、CLI が返した `turn.completed.usage` を保持する。repair が発生した job では attempt ごとに合算した値を返す。
+`CodexResponse.usage` は `dict[str, int] | None` で、SDK が返した `turn.completed.usage` を保持する。repair が発生した job では attempt ごとに合算した値を返す。
 
 `CodexResponse.argv` は最終的に成功した main attempt の argv を保持する。`CodexResponse.activity_log` は wrapper が積んだ phase log で、main attempt / validator / review / repair / file collection / cleanup / timeout / cancel の start/end/error を順に読める。各 entry には `phase`、`event`、`message`、必要に応じて `attempt`、`repair_index`、`argv`、`returncode`、`stdout`、`stderr` が入る。
 
@@ -175,12 +206,12 @@ Permission Profile は Codex CLI の sandbox runtime が機能していること
 
 ## エラー
 
-- `CodexExecutionError`: `codex exec` が non-zero で終了した。
+- `CodexExecutionError`: Codex job attempt が non-zero で終了した。
 - `CodexTimeoutError`: `result(timeout=...)` が timeout し、process が停止された。
 - `CodexCancelledError`: `cancel()` 後に `result()` が呼ばれた。
-- `CodexValidationError`: `codex exec` は成功したが、`output_validator` が失敗した。
+- `CodexValidationError`: Codex job は成功したが、`output_validator` が失敗した。
 
-error は `returncode`、`stdout`、`stderr`、`argv` を持つ。さらに `activity_log` で wrapper 側 phase log を読める。`CodexValidationError` は従来どおり validator / review 専用 field も保持するため、review output parse failure や review subprocess failure でも `codex exec communication failed: ...` に潰れず、review 側の stdout / stderr / argv を追える。
+error は `returncode`、`stdout`、`stderr`、`argv` を持つ。さらに `activity_log` で wrapper 側 phase log を読める。`CodexValidationError` は従来どおり validator / review 専用 field も保持するため、review output parse failure や review subprocess failure でも `codex job communication failed: ...` に潰れず、review 側の stdout / stderr / argv を追える。
 
 ## テスト
 
@@ -190,4 +221,4 @@ error は `returncode`、`stdout`、`stderr`、`argv` を持つ。さらに `act
 python -m unittest discover -s "$CODEX_HOME/skills/codex-job-runner/tests"
 ```
 
-unit test は fake `codex` executable を使うため、network access や実際の Codex session は不要である。
+unit test は fake SDK を使うため、network access や実際の Codex session は不要である。

@@ -1,4 +1,4 @@
-"""Client and job implementation for running ``codex exec``."""
+"""Client and job implementation for Codex SDK-backed jobs."""
 
 from __future__ import annotations
 
@@ -6,13 +6,16 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import uuid
 import json
+import importlib
+import traceback
 from dataclasses import dataclass, replace
-from typing import Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 from .errors import (
     CodexCancelledError,
@@ -36,7 +39,17 @@ _COMPLETED = "completed"
 _FAILED = "failed"
 _TIMEOUT = "timeout"
 _CANCELLED = "cancelled"
-_DEFAULT_REVIEW_TIMEOUT = 30
+_DEFAULT_REVIEW_TIMEOUT = None
+_API_PRICING_SOURCE_URL = "https://developers.openai.com/api/docs/pricing"
+_MODEL_PRICING_USD_PER_MILLION = {
+    "gpt-5.5": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.5-pro": {"input": 30.00, "cached_input": None, "output": 180.00},
+    "gpt-5.4": {"input": 2.50, "cached_input": 0.25, "output": 15.00},
+    "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50},
+    "gpt-5.4-nano": {"input": 0.20, "cached_input": 0.02, "output": 1.25},
+    "gpt-5.4-pro": {"input": 30.00, "cached_input": None, "output": 180.00},
+    "gpt-5.3-codex": {"input": 1.75, "cached_input": 0.175, "output": 14.00},
+}
 _REVIEW_OUTPUT_SCHEMA = json.dumps(
     {
         "type": "object",
@@ -46,7 +59,7 @@ _REVIEW_OUTPUT_SCHEMA = json.dumps(
             "repair_text": {"type": "string"},
             "summary": {"type": "string"},
         },
-        "required": ["passed", "repair_text"],
+        "required": ["passed", "repair_text", "summary"],
     },
     separators=(",", ":"),
 )
@@ -68,6 +81,7 @@ class _ResolvedOptions:
     cwd: pathlib.Path
     subcwd_root: pathlib.Path
     timeout: Optional[float]
+    ephemeral: bool
     ignore_global_context: bool
     allowed_skills: Optional[list[str]]
     allow_shell_commands: bool
@@ -77,7 +91,7 @@ class _ResolvedOptions:
 class _CodexAttempt:
     argv: list[str]
     prompt: str
-    process: subprocess.Popen
+    process: Any
     output_path: pathlib.Path
     attempt_index: int
     repair_index: int
@@ -116,10 +130,173 @@ class _ReviewResult:
     stdout: str
     stderr: str
     argv: list[str]
+    stream_emitted: bool = False
+
+
+class ReviewSession:
+    """Conversation session for a reviewer."""
+
+    def __init__(
+        self,
+        *,
+        send_turn,
+        close_session,
+    ):
+        self._send_turn = send_turn
+        self._close_session = close_session
+        self._lock = threading.RLock()
+        self._closed = False
+        self._history: list[tuple[str, str]] = []
+
+    @property
+    def history(self):
+        with self._lock:
+            return tuple(self._history)
+
+    def send(self, message, *, output_schema_path=None, activity_callback=None):
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("message must be a non-empty string")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("review session is closed")
+            history = tuple(self._history)
+        response = self._send_turn(
+            message=message.strip(),
+            history=history,
+            output_schema_path=output_schema_path,
+            activity_callback=activity_callback,
+        )
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("review session is closed")
+            self._history.append(("runner", message.strip()))
+            self._history.append(("reviewer", response.content))
+        return response
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._close_session()
+
+
+class _SdkProcess:
+    """Subprocess-like adapter backed by the ``openai-codex`` SDK."""
+
+    def __init__(self, *, runner):
+        self._runner = runner
+        self._thread = None
+        self._lock = threading.Lock()
+        self._terminated = threading.Event()
+        self._finished = threading.Event()
+        self._stdout = ""
+        self._stderr = ""
+        self._returncode = None
+        self._turn_handle = None
+        self._codex = None
+        self._error = None
+        self._activity_callback = None
+        self._emitted_stdout_lines = False
+
+    @property
+    def returncode(self):
+        return self._returncode
+
+    def communicate(self, prompt=None, timeout=None):
+        if self._thread is None:
+            if prompt is None:
+                raise RuntimeError("communicate() requires prompt on first call")
+
+            def target():
+                try:
+                    stdout, stderr, returncode = self._runner(self, prompt)
+                except Exception as exc:
+                    with self._lock:
+                        self._stdout = ""
+                        self._stderr = str(exc)
+                        self._returncode = 1
+                        self._error = exc
+                else:
+                    with self._lock:
+                        self._stdout = stdout or ""
+                        self._stderr = stderr or ""
+                        self._returncode = returncode
+                finally:
+                    self._finished.set()
+
+            self._thread = threading.Thread(target=target, name="codex_sdk_attempt", daemon=True)
+            self._thread.start()
+        elif prompt is not None:
+            raise RuntimeError("communicate() prompt may only be provided once")
+
+        if not self._finished.wait(timeout):
+            raise subprocess.TimeoutExpired(cmd="openai-codex", timeout=timeout)
+        return self._stdout, self._stderr
+
+    def poll(self):
+        if self._finished.is_set():
+            return self._returncode
+        return None
+
+    def wait(self, timeout=None):
+        if not self._finished.wait(timeout):
+            raise subprocess.TimeoutExpired(cmd="openai-codex", timeout=timeout)
+        return self._returncode
+
+    def terminate(self):
+        self._terminated.set()
+        turn_handle = self._turn_handle
+        codex = self._codex
+        if turn_handle is not None:
+            try:
+                turn_handle.interrupt()
+            except Exception:
+                pass
+        if codex is not None:
+            try:
+                codex.close()
+            except Exception:
+                pass
+
+    def kill(self):
+        self.terminate()
+
+    def set_turn_handle(self, turn_handle):
+        self._turn_handle = turn_handle
+
+    def set_codex(self, codex):
+        self._codex = codex
+
+    def set_activity_callback(self, callback):
+        self._activity_callback = callback
+
+    def emit_stdout_line(self, line):
+        callback = None
+        with self._lock:
+            self._emitted_stdout_lines = True
+            callback = self._activity_callback
+        if callback is not None:
+            callback(line)
+
+    def emitted_stdout_lines(self):
+        with self._lock:
+            return self._emitted_stdout_lines
+
+    def terminated(self):
+        return self._terminated.is_set()
+
+
+class _ActivityStreamEmitter:
+    def __init__(self, callback):
+        self._callback = callback
+
+    def emit_stdout_line(self, line):
+        self._callback(line)
 
 
 class CodexJob:
-    """A non-blocking ``codex exec`` subprocess."""
+    """A non-blocking Codex job handle."""
 
     def __init__(
         self,
@@ -145,13 +322,19 @@ class CodexJob:
         output_validator=None,
         validator_timeout=30,
         output_schema_path=None,
+        output_pydantic_model=None,
         repair_validation_failures=False,
         max_repairs=1,
+        max_validator_repairs=None,
+        max_review_repairs=None,
         repair_prompt_template=None,
         validator_env=None,
         validator_cwd=None,
+        log_dir=None,
+        log_path=None,
     ):
         self.id = "codex_job_" + uuid.uuid4().hex
+        self.log_path = _prepare_job_log_path(log_dir, self.id, log_path=log_path)
         self.argv = list(attempt.argv)
         self._spawn_attempt = spawn_attempt
         self._original_input = original_input
@@ -176,8 +359,16 @@ class CodexJob:
         self._output_validator = list(output_validator) if output_validator else None
         self._validator_timeout = validator_timeout
         self._output_schema_path = pathlib.Path(output_schema_path) if output_schema_path else None
+        self._output_pydantic_model = output_pydantic_model
+        self._temp_output_schema_path = None
         self._repair_validation_failures = bool(repair_validation_failures)
         self._max_repairs = max_repairs
+        self._max_validator_repairs = (
+            max_repairs if max_validator_repairs is None else max_validator_repairs
+        )
+        self._max_review_repairs = (
+            max_repairs if max_review_repairs is None else max_review_repairs
+        )
         self._repair_prompt_template = repair_prompt_template
         self._validator_env = dict(validator_env or {})
         self._validator_cwd = pathlib.Path(validator_cwd) if validator_cwd else None
@@ -191,6 +382,8 @@ class CodexJob:
         self._response = None
         self._error = None
         self._activity_log = []
+        if hasattr(self._process, "set_activity_callback"):
+            self._process.set_activity_callback(self._record_stream_event_line)
         self._log_activity(
             "main_attempt",
             "start",
@@ -221,12 +414,13 @@ class CodexJob:
         if not self._done.wait(timeout):
             self._timeout()
             raise CodexTimeoutError(
-                "codex exec timed out",
+                "codex job timed out",
                 returncode=None,
                 stdout=self._stdout,
                 stderr=self._stderr,
                 argv=self.argv,
                 activity_log=self._activity_log_snapshot(),
+                log_path=self.log_path,
             )
 
         with self._lock:
@@ -234,22 +428,24 @@ class CodexJob:
                 return self._response
             if self._status == _CANCELLED:
                 raise CodexCancelledError(
-                    "codex exec was cancelled",
+                    "codex job was cancelled",
                     returncode=self._returncode,
                     stdout=self._stdout,
                     stderr=self._stderr,
                     argv=self.argv,
                     activity_log=self._activity_log_snapshot(),
+                    log_path=self.log_path,
                 )
             if self._error is not None:
                 raise self._error
             raise CodexExecutionError(
-                "codex exec failed",
+                "codex job failed",
                 returncode=self._returncode,
                 stdout=self._stdout,
                 stderr=self._stderr,
                 argv=self.argv,
                 activity_log=self._activity_log_snapshot(),
+                log_path=self.log_path,
             )
 
     def cancel(self):
@@ -273,6 +469,8 @@ class CodexJob:
     def _communicate(self):
         attempt = self._attempt
         repairs = 0
+        validator_repairs = 0
+        review_repairs = 0
         last_validation = None
         usage_totals = None
         try:
@@ -314,8 +512,20 @@ class CodexJob:
                     stdout=stdout or "",
                     stderr=stderr or "",
                 )
+                self._log_usage_activity(
+                    phase="main_attempt",
+                    model=self._resolved_model_name(attempt.argv),
+                    usage=usage,
+                    attempt=attempt.attempt_index,
+                    repair_index=attempt.repair_index,
+                )
 
                 content = self._read_output_file(attempt.output_path)
+                pricing = _resolve_model_pricing(self._resolved_model_name(attempt.argv))
+                estimated_cost_usd = _estimate_cost_usd_for_usage(
+                    usage=_copy_optional_usage(usage_totals),
+                    pricing=pricing,
+                )
                 last_response = CodexResponse(
                     content=content,
                     returncode=returncode,
@@ -323,11 +533,14 @@ class CodexJob:
                     stderr=stderr or "",
                     argv=tuple(attempt.argv),
                     usage=_copy_optional_usage(usage_totals),
+                    pricing=_copy_optional_pricing(pricing),
+                    estimated_cost_usd=estimated_cost_usd,
                     files={},
                     activity_log=(),
+                    log_path=self.log_path,
                 )
 
-                if self._output_validator is None:
+                if self._output_validator is None and self._output_pydantic_model is None:
                     last_validation = None
                 else:
                     last_validation = self._run_validator(
@@ -343,7 +556,7 @@ class CodexJob:
                     if last_validation.returncode != 0:
                         if last_validation.timed_out or (
                             not self._repair_validation_failures
-                            or repairs >= self._max_repairs
+                            or validator_repairs >= self._max_validator_repairs
                         ):
                             self._set_validation_error(
                                 response=last_response,
@@ -355,13 +568,7 @@ class CodexJob:
                             return
 
                         repairs += 1
-                        self._log_activity(
-                            "repair",
-                            "start",
-                            "repair attempt requested after validator failure",
-                            attempt=attempt.attempt_index + 1,
-                            repair_index=repairs,
-                        )
+                        validator_repairs += 1
                         prompt = self._build_repair_prompt(
                             response=last_response,
                             validation=last_validation,
@@ -381,14 +588,6 @@ class CodexJob:
                             "main_attempt",
                             "start",
                             "repair main attempt started",
-                            attempt=attempt.attempt_index,
-                            repair_index=attempt.repair_index,
-                            argv=attempt.argv,
-                        )
-                        self._log_activity(
-                            "repair",
-                            "end",
-                            "repair attempt spawned",
                             attempt=attempt.attempt_index,
                             repair_index=attempt.repair_index,
                             argv=attempt.argv,
@@ -424,7 +623,7 @@ class CodexJob:
                     self._finish()
                     return
 
-                if repairs >= self._max_repairs:
+                if review_repairs >= self._max_review_repairs:
                     self._set_review_error(
                         response=last_response,
                         review=review_result,
@@ -435,13 +634,7 @@ class CodexJob:
                     return
 
                 repairs += 1
-                self._log_activity(
-                    "repair",
-                    "start",
-                    "repair attempt requested after review failure",
-                    attempt=attempt.attempt_index + 1,
-                    repair_index=repairs,
-                )
+                review_repairs += 1
                 prompt = self._build_repair_prompt(
                     response=last_response,
                     validation=last_validation,
@@ -462,14 +655,6 @@ class CodexJob:
                     "main_attempt",
                     "start",
                     "repair main attempt started",
-                    attempt=attempt.attempt_index,
-                    repair_index=attempt.repair_index,
-                    argv=attempt.argv,
-                )
-                self._log_activity(
-                    "repair",
-                    "end",
-                    "repair attempt spawned",
                     attempt=attempt.attempt_index,
                     repair_index=attempt.repair_index,
                     argv=attempt.argv,
@@ -505,18 +690,21 @@ class CodexJob:
                 if self._status == _RUNNING:
                     self._status = _FAILED
                 self._error = CodexExecutionError(
-                    f"codex exec communication failed: {exc}",
+                    f"codex job communication failed: {exc}",
                     returncode=None,
                     stdout=self._stdout,
                     stderr=self._stderr,
                     argv=self.argv,
                     activity_log=self._activity_log_snapshot(),
+                    log_path=self.log_path,
                 )
             self._finish()
             return
 
     def _run_attempt(self, attempt):
         stdout, stderr = attempt.process.communicate(attempt.prompt)
+        if not getattr(attempt.process, "emitted_stdout_lines", lambda: False)():
+            self._record_stream_events_from_stdout(stdout or "")
         return (
             stdout,
             stderr,
@@ -535,26 +723,34 @@ class CodexJob:
                     stderr=response.stderr,
                     argv=tuple(response.argv),
                     usage=_copy_optional_usage(response.usage),
+                    pricing=_copy_optional_pricing(response.pricing),
+                    estimated_cost_usd=response.estimated_cost_usd,
                     files=files,
                     activity_log=tuple(self._activity_log_snapshot()),
+                    log_path=self.log_path,
                 )
                 self._status = _COMPLETED
             else:
                 self._status = _FAILED
                 self._error = CodexExecutionError(
-                    f"codex exec file collection failed: {collection_error}",
+                    f"codex job file collection failed: {collection_error}",
                     returncode=response.returncode,
                     stdout=self._stdout,
                     stderr=self._stderr,
                     argv=self.argv,
                     activity_log=self._activity_log_snapshot(),
+                    log_path=self.log_path,
                 )
 
     def _set_execution_error(self, returncode):
         files, collection_error = self._collect_output_files()
-        message = f"codex exec exited with status {returncode}"
+        message = f"codex job exited with status {returncode}"
         if collection_error is not None:
             message += f"; file collection failed: {collection_error}"
+        if self._stderr:
+            message += f"\nstderr:\n{self._stderr}"
+        if self._stdout:
+            message += f"\nstdout:\n{self._stdout}"
         with self._lock:
             self._status = _FAILED
             self._error = CodexExecutionError(
@@ -565,6 +761,7 @@ class CodexJob:
                 argv=self.argv,
                 files=files,
                 activity_log=self._activity_log_snapshot(),
+                log_path=self.log_path,
             )
 
     def _set_validation_error(self, *, response, validation, attempts, repairs):
@@ -573,7 +770,7 @@ class CodexJob:
             with self._lock:
                 self._status = _FAILED
                 self._error = CodexExecutionError(
-                    f"codex exec file collection failed: {collection_error}",
+                    f"codex job file collection failed: {collection_error}",
                     returncode=response.returncode,
                     stdout=self._stdout,
                     stderr=self._stderr,
@@ -587,8 +784,11 @@ class CodexJob:
             stderr=response.stderr,
             argv=tuple(response.argv),
             usage=_copy_optional_usage(response.usage),
+            pricing=_copy_optional_pricing(response.pricing),
+            estimated_cost_usd=response.estimated_cost_usd,
             files=files,
             activity_log=tuple(self._activity_log_snapshot()),
+            log_path=self.log_path,
         )
         if validation.timed_out:
             message = "codex output validator timed out"
@@ -607,6 +807,7 @@ class CodexJob:
                 repairs=repairs,
                 files=files,
                 activity_log=self._activity_log_snapshot(),
+                log_path=self.log_path,
             )
 
     def _set_review_error(self, *, response, review, attempts, repairs):
@@ -615,7 +816,7 @@ class CodexJob:
             with self._lock:
                 self._status = _FAILED
                 self._error = CodexExecutionError(
-                    f"codex exec file collection failed: {collection_error}",
+                    f"codex job file collection failed: {collection_error}",
                     returncode=response.returncode,
                     stdout=self._stdout,
                     stderr=self._stderr,
@@ -629,13 +830,16 @@ class CodexJob:
             stderr=response.stderr,
             argv=tuple(response.argv),
             usage=_copy_optional_usage(response.usage),
+            pricing=_copy_optional_pricing(response.pricing),
+            estimated_cost_usd=response.estimated_cost_usd,
             files=files,
             activity_log=tuple(self._activity_log_snapshot()),
+            log_path=self.log_path,
         )
         with self._lock:
             self._status = _FAILED
             self._error = CodexValidationError(
-                "codex review reported issues",
+                _review_failure_message(review),
                 response=response,
                 validator_returncode=None,
                 validator_stdout="",
@@ -650,6 +854,7 @@ class CodexJob:
                 review_stderr=review.stderr,
                 review_argv=review.argv,
                 activity_log=self._activity_log_snapshot(),
+                log_path=self.log_path,
             )
 
     def _collect_output_files(self):
@@ -675,15 +880,19 @@ class CodexJob:
             return {}, exc
 
     def _run_validator(self, response, *, attempt_index, repair_index):
+        primary_argv = self._output_validator
+        if primary_argv is None and self._output_pydantic_model is not None:
+            primary_argv = ["pydantic", _pydantic_model_label(self._output_pydantic_model)]
         self._log_activity(
             "validator",
             "start",
             "validator started",
             attempt=attempt_index,
             repair_index=repair_index,
-            argv=self._output_validator,
+            argv=primary_argv,
         )
         timed_out = False
+        validation_returncode = 0
         stdout = ""
         stderr = ""
         env = dict(self._validator_env)
@@ -695,19 +904,47 @@ class CodexJob:
         if self._subcwd_path is not None:
             env["CODEX_WRAPPER_SUBCWD"] = str(self._subcwd_path)
 
-        process = subprocess.Popen(
-            self._output_validator,
-            cwd=str(self._validator_cwd),
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-        )
-        with self._lock:
-            self._validator_process = process
+        process = None
         try:
+            if self._output_pydantic_model is not None:
+                pydantic_result = _run_pydantic_validation(
+                    model=self._output_pydantic_model,
+                    content=response.content,
+                )
+                if pydantic_result.returncode != 0:
+                    validation_returncode = pydantic_result.returncode
+                    stdout = pydantic_result.stdout
+                    stderr = pydantic_result.stderr
+                    return pydantic_result
+                if pydantic_result.stderr:
+                    self._log_activity(
+                        "validator",
+                        "detail",
+                        pydantic_result.stderr,
+                        attempt=attempt_index,
+                        repair_index=repair_index,
+                        argv=pydantic_result.argv,
+                        stderr=pydantic_result.stderr,
+                    )
+            if self._output_validator is None:
+                return _ValidationResult(
+                    returncode=0,
+                    stdout=stdout,
+                    stderr=stderr,
+                    argv=primary_argv or [],
+                )
+            process = subprocess.Popen(
+                self._output_validator,
+                cwd=str(self._validator_cwd),
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            with self._lock:
+                self._validator_process = process
             try:
                 stdout, stderr = process.communicate(
                     response.content,
@@ -741,13 +978,35 @@ class CodexJob:
                 ),
                 attempt=attempt_index,
                 repair_index=repair_index,
-                argv=self._output_validator,
-                returncode=process.returncode,
+                argv=(self._output_validator or primary_argv),
+                returncode=(
+                    process.returncode if process is not None else validation_returncode
+                ),
                 stdout=locals().get("stdout", "") or "",
                 stderr=locals().get("stderr", "") or "",
             )
+            if stdout:
+                self._log_activity(
+                    "validator",
+                    "detail",
+                    f"validator stdout:\n{stdout.rstrip()}",
+                    attempt=attempt_index,
+                    repair_index=repair_index,
+                    argv=(self._output_validator or primary_argv),
+                    stdout=stdout,
+                )
+            if stderr:
+                self._log_activity(
+                    "validator",
+                    "detail",
+                    f"validator stderr:\n{stderr.rstrip()}",
+                    attempt=attempt_index,
+                    repair_index=repair_index,
+                    argv=(self._output_validator or primary_argv),
+                    stderr=stderr,
+                )
             with self._lock:
-                if self._validator_process is process:
+                if process is not None and self._validator_process is process:
                     self._validator_process = None
 
     def _run_review(self, *, response, main_prompt):
@@ -764,6 +1023,11 @@ class CodexJob:
             "start",
             "review started",
         )
+        self._log_activity(
+            "review",
+            "input_json",
+            _format_review_response_for_log(response.content),
+        )
         try:
             result = self._review_runner(
                 original_input=self._original_input,
@@ -771,6 +1035,10 @@ class CodexJob:
                 response=response,
                 subcwd_path=self._subcwd_path,
                 review_config=self._review_config,
+                stream_callback=lambda line: self._record_stream_event_line(
+                    line,
+                    detail="review",
+                ),
             )
         except CodexExecutionError as exc:
             self._log_activity(
@@ -790,6 +1058,8 @@ class CodexJob:
                 f"review failed before producing a result: {exc}",
             )
             raise
+        if result.stdout and not result.stream_emitted:
+            self._record_stream_events_from_stdout(result.stdout, detail="review")
         self._log_activity(
             "review",
             "end",
@@ -799,7 +1069,53 @@ class CodexJob:
             stdout=result.stdout,
             stderr=result.stderr,
         )
+        self._log_usage_activity(
+            phase="review",
+            model=_response_model_name(result.response),
+            usage=result.response.usage,
+        )
+        if isinstance(result.summary, str) and result.summary.strip():
+            self._log_activity(
+                "review",
+                "detail",
+                f"review summary: {result.summary.strip()}",
+            )
+        if not result.passed and isinstance(result.repair_text, str) and result.repair_text.strip():
+            self._log_activity(
+                "review",
+                "detail",
+                f"review repair request: {result.repair_text.strip()}",
+            )
         return result
+
+    def _resolved_model_name(self, argv):
+        for index, token in enumerate(argv):
+            if token == "--model" and index + 1 < len(argv):
+                model = argv[index + 1]
+                if isinstance(model, str) and model.strip():
+                    return model.strip()
+        return self._infer_default_model()
+
+    def _infer_default_model(self):
+        attempt = getattr(self, "_attempt", None)
+        if attempt is not None:
+            for index, token in enumerate(attempt.argv):
+                if token == "--model" and index + 1 < len(attempt.argv):
+                    model = attempt.argv[index + 1]
+                    if isinstance(model, str) and model.strip():
+                        return model.strip()
+        return _DEFAULT_MODEL
+
+    def _log_usage_activity(self, *, phase, model, usage, attempt=None, repair_index=None):
+        if usage is None:
+            return
+        self._log_activity(
+            phase,
+            "usage",
+            _format_usage_summary(model=model, usage=usage),
+            attempt=attempt,
+            repair_index=repair_index,
+        )
 
     def _build_repair_prompt(
         self,
@@ -814,11 +1130,19 @@ class CodexJob:
             "original_input": self._original_input,
             "attempt": str(attempt_index),
             "repair_attempt": str(repair_index),
+            "failure_stage": (
+                "review"
+                if review is not None
+                else "validator"
+                if validation is not None
+                else "unknown"
+            ),
             "validator_returncode": (
                 "" if validation is None else str(validation.returncode)
             ),
             "validator_stdout": "" if validation is None else validation.stdout,
             "validator_stderr": "" if validation is None else validation.stderr,
+            "checklist_feedback": _extract_checklist_feedback(validation),
             "previous_content": response.content,
             "subcwd_section": self._repair_subcwd_section(),
             "review_summary": "" if review is None else review.summary,
@@ -863,6 +1187,7 @@ class CodexJob:
         event,
         message,
         *,
+        detail=None,
         attempt=None,
         repair_index=None,
         argv=None,
@@ -874,6 +1199,7 @@ class CodexJob:
             phase=phase,
             event=event,
             message=message,
+            detail=detail,
             attempt=attempt,
             repair_index=repair_index,
             argv=tuple(argv or ()),
@@ -883,6 +1209,52 @@ class CodexJob:
         )
         with self._lock:
             self._activity_log.append(entry)
+        _emit_activity_stdout(entry)
+        self._append_log_line(_format_activity_stdout(entry))
+
+    def _append_log_line(self, line):
+        if self.log_path is None:
+            return
+        try:
+            pathlib.Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except Exception:
+            pass
+
+    def _record_stream_events_from_stdout(self, stdout, *, detail=None):
+        for line in stdout.splitlines():
+            self._record_stream_event_line(line, detail=detail)
+
+    def _record_stream_event_line(self, line, *, detail=None):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(event, dict):
+            return
+        event_type = event.get("type")
+        if not isinstance(event_type, str):
+            return
+        message = f"stream event observed: {event_type}"
+        if event_type in {"item.completed", "item.delta"}:
+            item_type = event.get("item_type")
+            item_text = event.get("item_text") or event.get("delta_text")
+            if isinstance(item_type, str) and isinstance(item_text, str) and item_text:
+                message = f"stream event observed: {event_type} ({item_type}): {item_text}"
+            elif isinstance(item_type, str):
+                message = f"stream event observed: {event_type} ({item_type})"
+        elif event_type == "plan.updated":
+            summary = event.get("summary")
+            if isinstance(summary, str) and summary:
+                message = f"stream event observed: plan.updated: {summary}"
+        self._log_activity(
+            "stream",
+            event_type,
+            message,
+            detail=detail,
+            stdout=line,
+        )
 
     def _activity_log_snapshot(self):
         with self._lock:
@@ -894,6 +1266,7 @@ class CodexJob:
 
     def _finish(self):
         self._cleanup_output_files()
+        self._cleanup_temp_output_schema()
         self._cleanup_subcwd()
         self._sync_activity_log_to_outcome()
         self._done.set()
@@ -928,6 +1301,16 @@ class CodexJob:
             return
         self._log_activity("cleanup", "end", "subcwd cleanup finished")
 
+    def _cleanup_temp_output_schema(self):
+        if self._temp_output_schema_path is None:
+            return
+        self._log_activity("cleanup", "start", "temp output schema cleanup started")
+        try:
+            self._temp_output_schema_path.unlink()
+        except FileNotFoundError:
+            pass
+        self._log_activity("cleanup", "end", "temp output schema cleanup finished")
+
     def _terminate_process(self):
         with self._lock:
             process = self._process
@@ -943,9 +1326,10 @@ class CodexJob:
         snapshot = tuple(self._activity_log_snapshot())
         with self._lock:
             if self._response is not None:
-                self._response = replace(self._response, activity_log=snapshot)
+                self._response = replace(self._response, activity_log=snapshot, log_path=self.log_path)
             if self._error is not None:
                 self._error.activity_log = list(snapshot)
+                self._error.log_path = self.log_path
 
     def _refresh_status(self):
         if self._done.is_set():
@@ -955,23 +1339,23 @@ class CodexJob:
 
 
 class CodexClient:
-    """OpenAI-like entry point for a minimal ``codex exec`` wrapper."""
+    """OpenAI-like entry point for a minimal Codex job wrapper."""
 
     def __init__(
         self,
         *,
-        codex_bin="codex",
         model=_DEFAULT_MODEL,
         reasoning_effort=_DEFAULT_REASONING_EFFORT,
         cwd=None,
         subcwd_root=None,
         timeout=None,
+        ephemeral=True,
         ignore_global_context=False,
         allowed_skills=None,
         allow_shell_commands=True,
         env=None,
+        log_dir=None,
     ):
-        self.codex_bin = codex_bin
         self.model = model
         self.reasoning_effort = _normalize_optional_reasoning_effort(
             reasoning_effort
@@ -979,10 +1363,12 @@ class CodexClient:
         self.cwd = cwd
         self.subcwd_root = subcwd_root
         self.timeout = timeout
+        self.ephemeral = bool(ephemeral)
         self.ignore_global_context = ignore_global_context
         self.allowed_skills = _copy_optional_list(allowed_skills)
         self.allow_shell_commands = bool(allow_shell_commands)
         self.env = dict(env or {})
+        self.log_dir = pathlib.Path(log_dir).expanduser() if log_dir is not None else None
 
     def start(
         self,
@@ -996,15 +1382,19 @@ class CodexClient:
         reasoning_effort=None,
         cwd=None,
         timeout=None,
+        ephemeral=None,
         review=None,
         ignore_global_context=None,
         allowed_skills=None,
         allow_shell_commands=None,
         output_schema_path=None,
+        output_pydantic_model=None,
         output_validator=None,
         validator_timeout=30,
         repair_validation_failures=False,
         max_repairs=1,
+        max_validator_repairs=None,
+        max_review_repairs=None,
         repair_prompt_path=None,
         collect_files=False,
         max_files=_DEFAULT_MAX_FILES,
@@ -1013,15 +1403,21 @@ class CodexClient:
         inline_attachments=True,
         max_inline_attachment_bytes=_DEFAULT_MAX_INLINE_ATTACHMENT_BYTES,
         max_inline_attachment_total_bytes=_DEFAULT_MAX_INLINE_ATTACHMENT_TOTAL_BYTES,
+        log_path=None,
     ):
         if not isinstance(input, str) or not input.strip():
             raise ValueError("input must be a non-empty string")
+        if output_schema_path is not None and output_pydantic_model is not None:
+            raise ValueError(
+                "output_schema_path and output_pydantic_model are mutually exclusive"
+            )
 
         options = self._resolve_options(
             model=model,
             reasoning_effort=reasoning_effort,
             cwd=cwd,
             timeout=timeout,
+            ephemeral=ephemeral,
             ignore_global_context=ignore_global_context,
             allowed_skills=allowed_skills,
             allow_shell_commands=allow_shell_commands,
@@ -1031,11 +1427,26 @@ class CodexClient:
         attachments = _normalize_paths(attachments or [], options.cwd, must_exist=True)
         read_paths = _normalize_paths(read_paths or [], options.cwd, must_exist=True)
         subcwd_files = _normalize_subcwd_files(subcwd_files)
+        normalized_output_pydantic_model = _normalize_output_pydantic_model(
+            output_pydantic_model
+        )
         output_schema_path = _normalize_optional_path(
             output_schema_path,
             options.cwd,
             must_exist=True,
         )
+        temp_output_schema_path = None
+        if normalized_output_pydantic_model is not None:
+            temp_output_schema_path = pathlib.Path(
+                _make_temp_text_file(
+                    prefix="codex_api_wrapper_output_schema_",
+                    suffix=".json",
+                    text=_render_pydantic_output_schema_json(
+                        normalized_output_pydantic_model
+                    ),
+                )
+            )
+            output_schema_path = temp_output_schema_path
         output_schema_section, output_schema_inline_bytes = (
             _resolve_inline_output_schema_section(
                 output_schema_path=output_schema_path,
@@ -1050,6 +1461,11 @@ class CodexClient:
             initial_total_bytes=output_schema_inline_bytes,
         )
         output_validator = _normalize_output_validator(output_validator, options.cwd)
+        normalized_log_path = _normalize_optional_path(
+            log_path,
+            options.cwd,
+            must_exist=False,
+        ) if log_path is not None else None
         repair_prompt_path = _normalize_optional_path(
             repair_prompt_path,
             options.cwd,
@@ -1060,6 +1476,14 @@ class CodexClient:
             repair_prompt_template = repair_prompt_path.read_text(encoding="utf-8")
         if not isinstance(max_repairs, int) or max_repairs < 0:
             raise ValueError("max_repairs must be a non-negative integer")
+        if max_validator_repairs is not None and (
+            not isinstance(max_validator_repairs, int) or max_validator_repairs < 0
+        ):
+            raise ValueError("max_validator_repairs must be a non-negative integer or None")
+        if max_review_repairs is not None and (
+            not isinstance(max_review_repairs, int) or max_review_repairs < 0
+        ):
+            raise ValueError("max_review_repairs must be a non-negative integer or None")
         review_config = _normalize_review_config(review, options.cwd)
         write_paths, subcwd_path = _normalize_write_paths(
             write_paths or [],
@@ -1074,8 +1498,6 @@ class CodexClient:
             raise
 
         prompt_subcwd_files = _prompt_subcwd_file_paths(subcwd_files)
-        review_profile_name = "codex_api_wrapper_review_" + uuid.uuid4().hex
-
         prompt = _build_prompt(
             input=input,
             attachments=attachments,
@@ -1093,31 +1515,25 @@ class CodexClient:
 
         def spawn_attempt(*, prompt, attempt_index, repair_index):
             output_path = _make_output_path()
-            argv = self._build_argv(
-                output_path=output_path,
+            argv = self._build_sdk_argv(
                 profile_name=profile_name,
                 options=options,
                 read_paths=read_paths,
                 write_paths=write_paths,
                 output_schema_path=output_schema_path,
             )
-            try:
-                process = subprocess.Popen(
-                    argv,
-                    cwd=str(options.cwd),
-                    env=env,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
+            process = _SdkProcess(
+                runner=lambda process_obj, prompt_text: self._run_sdk_attempt(
+                    process=process_obj,
+                    prompt=prompt_text,
+                    output_path=pathlib.Path(output_path),
+                    profile_name=profile_name,
+                    options=options,
+                    read_paths=read_paths,
+                    write_paths=write_paths,
+                    output_schema_path=output_schema_path,
                 )
-            except Exception:
-                try:
-                    pathlib.Path(output_path).unlink()
-                except FileNotFoundError:
-                    pass
-                raise
+            )
             return _CodexAttempt(
                 argv=list(argv),
                 prompt=prompt,
@@ -1127,24 +1543,10 @@ class CodexClient:
                 repair_index=repair_index,
             )
 
-        def run_review(*, original_input, main_prompt, response, subcwd_path, review_config):
-            review_options = _ResolvedOptions(
-                model=(
-                    review_config.model
-                    if review_config.model is not None
-                    else options.model
-                ),
-                reasoning_effort=(
-                    review_config.reasoning_effort
-                    if review_config.reasoning_effort is not None
-                    else options.reasoning_effort
-                ),
-                cwd=options.cwd,
-                subcwd_root=options.subcwd_root,
-                timeout=review_config.timeout,
-                ignore_global_context=options.ignore_global_context,
-                allowed_skills=options.allowed_skills,
-                allow_shell_commands=options.allow_shell_commands,
+        def run_review(*, original_input, main_prompt, response, subcwd_path, review_config, stream_callback):
+            review_options = self._review_options(
+                review_config=review_config,
+                options=options,
             )
             review_read_paths = []
             if subcwd_path is not None:
@@ -1169,88 +1571,37 @@ class CodexClient:
                     subcwd_path=subcwd_path,
                     review_config=review_config,
                 )
-                review_prompt = _build_prompt(
-                    input=review_input,
-                    attachments=[],
-                    read_paths=review_read_paths,
-                    write_paths=[],
-                    subcwd_files=[],
-                    subcwd_path=None,
-                    ignore_global_context=review_options.ignore_global_context,
-                    output_schema_section=output_schema_section,
-                )
-                argv = self._build_argv(
-                    output_path=str(output_path),
-                    profile_name=review_profile_name,
+                review_session = self._create_review_session(
+                    review_config=review_config,
                     options=review_options,
                     read_paths=review_read_paths,
-                    write_paths=[],
-                    output_schema_path=schema_path,
-                )
-                process = subprocess.Popen(
-                    argv,
-                    cwd=str(review_options.cwd),
-                    env=env,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
                 )
                 try:
-                    stdout, stderr = process.communicate(
-                        review_prompt,
-                        timeout=review_config.timeout,
+                    review_response = review_session.send(
+                        review_input,
+                        output_schema_path=schema_path,
+                        activity_callback=stream_callback,
                     )
-                except subprocess.TimeoutExpired:
-                    _terminate_process_object(process)
-                    stdout, stderr = process.communicate()
-                    raise CodexExecutionError(
-                        "codex review job timed out",
-                        returncode=None,
-                        stdout=stdout or "",
-                        stderr=stderr or "",
-                        argv=argv,
-                    )
-                if process.returncode != 0:
-                    raise CodexExecutionError(
-                        f"codex review job exited with status {process.returncode}",
-                        returncode=process.returncode,
-                        stdout=stdout or "",
-                        stderr=stderr or "",
-                        argv=argv,
-                    )
-                content = output_path.read_text(encoding="utf-8")
+                finally:
+                    review_session.close()
+                content = review_response.content
                 parsed = _parse_review_output(
                     content,
-                    stdout=stdout or "",
-                    stderr=stderr or "",
-                    argv=argv,
-                )
-                review_response = CodexResponse(
-                    content=content,
-                    returncode=process.returncode,
-                    stdout=stdout or "",
-                    stderr=stderr or "",
-                    argv=tuple(argv),
-                    usage=_extract_usage_from_stdout(stdout or ""),
-                    files={},
-                    activity_log=(),
+                    stdout=review_response.stdout,
+                    stderr=review_response.stderr,
+                    argv=list(review_response.argv),
                 )
                 return _ReviewResult(
                     passed=parsed["passed"],
                     repair_text=parsed["repair_text"],
                     summary=parsed["summary"],
                     response=review_response,
-                    stdout=stdout or "",
-                    stderr=stderr or "",
-                    argv=list(argv),
+                    stdout=review_response.stdout,
+                    stderr=review_response.stderr,
+                    argv=list(review_response.argv),
+                    stream_emitted=True,
                 )
             finally:
-                try:
-                    output_path.unlink()
-                except FileNotFoundError:
-                    pass
                 try:
                     schema_path.unlink()
                 except FileNotFoundError:
@@ -1263,9 +1614,14 @@ class CodexClient:
                 repair_index=0,
             )
         except Exception:
+            if temp_output_schema_path is not None:
+                try:
+                    temp_output_schema_path.unlink()
+                except FileNotFoundError:
+                    pass
             _cleanup_tree(subcwd_path)
             raise
-        return CodexJob(
+        job = CodexJob(
             attempt=attempt,
             spawn_attempt=spawn_attempt,
             original_input=input.strip(),
@@ -1287,17 +1643,64 @@ class CodexClient:
             output_validator=output_validator,
             validator_timeout=validator_timeout,
             output_schema_path=output_schema_path,
+            output_pydantic_model=normalized_output_pydantic_model,
             repair_validation_failures=repair_validation_failures,
             max_repairs=max_repairs,
+            max_validator_repairs=max_validator_repairs,
+            max_review_repairs=max_review_repairs,
             repair_prompt_template=repair_prompt_template,
             validator_env=env,
             validator_cwd=options.cwd,
+            log_dir=(self.log_dir or options.cwd / ".codex-job-runner-logs"),
+            log_path=normalized_log_path,
         )
+        job._temp_output_schema_path = temp_output_schema_path
+        return job
 
     def run(self, **kwargs):
         timeout = kwargs.pop("timeout", None)
         job = self.start(timeout=timeout, **kwargs)
         return job.result(timeout=timeout)
+
+    def start_review_session(
+        self,
+        *,
+        review,
+        read_paths=None,
+        model=None,
+        reasoning_effort=None,
+        cwd=None,
+        ephemeral=None,
+        ignore_global_context=None,
+        allowed_skills=None,
+        allow_shell_commands=None,
+    ):
+        options = self._resolve_options(
+            model=model,
+            reasoning_effort=reasoning_effort,
+            cwd=cwd,
+            timeout=None,
+            ephemeral=ephemeral,
+            ignore_global_context=ignore_global_context,
+            allowed_skills=allowed_skills,
+            allow_shell_commands=allow_shell_commands,
+        )
+        _reject_subcwd_token(read_paths or [], "read_paths")
+        review_read_paths = _normalize_paths(
+            read_paths or [],
+            options.cwd,
+            must_exist=True,
+        )
+        review_config = _normalize_review_config(review, options.cwd)
+        review_options = self._review_options(
+            review_config=review_config,
+            options=options,
+        )
+        return self._create_review_session(
+            review_config=review_config,
+            options=review_options,
+            read_paths=review_read_paths,
+        )
 
     def wait_any(self, jobs, timeout=None):
         jobs = list(jobs)
@@ -1310,6 +1713,62 @@ class CodexClient:
                 return None
             time.sleep(0.05)
 
+    def _review_options(self, *, review_config, options):
+        return _ResolvedOptions(
+            model=(
+                review_config.model
+                if review_config.model is not None
+                else options.model
+            ),
+            reasoning_effort=(
+                review_config.reasoning_effort
+                if review_config.reasoning_effort is not None
+                else options.reasoning_effort
+            ),
+            cwd=options.cwd,
+            subcwd_root=options.subcwd_root,
+            timeout=review_config.timeout,
+            ephemeral=options.ephemeral,
+            ignore_global_context=options.ignore_global_context,
+            allowed_skills=options.allowed_skills,
+            allow_shell_commands=options.allow_shell_commands,
+        )
+
+    def _create_review_session(self, *, review_config, options, read_paths):
+        review_profile_name = "codex_api_wrapper_review_" + uuid.uuid4().hex
+        lock = threading.RLock()
+        sdk_state = {"codex": None, "thread": None}
+
+        def close_session():
+            with lock:
+                codex = sdk_state["codex"]
+                sdk_state["codex"] = None
+                sdk_state["thread"] = None
+            if codex is not None:
+                try:
+                    codex.close()
+                except Exception:
+                    pass
+
+        def send_turn(*, message, history, output_schema_path, activity_callback=None):
+            return self._run_sdk_review_session_turn(
+                review_config=review_config,
+                options=options,
+                read_paths=read_paths,
+                profile_name=review_profile_name,
+                message=message,
+                history=history,
+                output_schema_path=output_schema_path,
+                activity_callback=activity_callback,
+                sdk_state=sdk_state,
+                lock=lock,
+            )
+
+        return ReviewSession(
+            send_turn=send_turn,
+            close_session=close_session,
+        )
+
     def _resolve_options(
         self,
         *,
@@ -1317,6 +1776,7 @@ class CodexClient:
         reasoning_effort,
         cwd,
         timeout,
+        ephemeral,
         ignore_global_context,
         allowed_skills,
         allow_shell_commands,
@@ -1348,15 +1808,15 @@ class CodexClient:
             cwd=resolved_cwd,
             subcwd_root=_normalize_subcwd_root(self.subcwd_root, resolved_cwd),
             timeout=timeout if timeout is not None else self.timeout,
+            ephemeral=self.ephemeral if ephemeral is None else bool(ephemeral),
             ignore_global_context=bool(resolved_ignore),
             allowed_skills=resolved_allowed_skills,
             allow_shell_commands=resolved_allow_shell_commands,
         )
 
-    def _build_argv(
+    def _build_sdk_argv(
         self,
         *,
-        output_path,
         profile_name,
         options,
         read_paths,
@@ -1364,59 +1824,288 @@ class CodexClient:
         output_schema_path,
     ):
         argv = [
-            self.codex_bin,
-            "--ask-for-approval",
-            "never",
-            "exec",
-            "--json",
-            "--output-last-message",
-            output_path,
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "-C",
+            "openai-codex",
+            "thread.run",
+            "--cwd",
             str(options.cwd),
         ]
         if options.model:
             argv.extend(["--model", options.model])
         if options.reasoning_effort:
-            argv.extend(
-                [
-                    "-c",
-                    f"model_reasoning_effort={_toml_string(options.reasoning_effort)}",
-                ]
-            )
+            argv.extend(["--effort", options.reasoning_effort])
         if output_schema_path is not None:
             argv.extend(["--output-schema", str(output_schema_path)])
         if options.ignore_global_context:
-            argv.append("--ignore-user-config")
             argv.extend(["-c", "project_doc_max_bytes=0"])
         if not options.allow_shell_commands:
             argv.extend(["-c", "features.shell_tool=false"])
             argv.extend(["-c", "allow_login_shell=false"])
-
-        extra_profile_read_paths = []
-        if options.allow_shell_commands:
-            extra_profile_read_paths = _codex_runtime_read_paths(self.codex_bin)
+        if options.allowed_skills == []:
+            argv.extend(["-c", "skills.include_instructions=false"])
         filesystem_profile = _filesystem_inline_table(
             options.cwd,
             read_paths,
             write_paths,
-            extra_read_paths=extra_profile_read_paths,
         )
-        argv.extend(_skill_config_args(options.allowed_skills))
         argv.extend(
             [
                 "-c",
                 f"default_permissions={_toml_string(profile_name)}",
                 "-c",
-                (
-                    f"permissions.{profile_name}.filesystem="
-                    f"{filesystem_profile}"
-                ),
+                f"permissions.{profile_name}.filesystem={filesystem_profile}",
             ]
         )
-        argv.append("-")
         return argv
+
+    def _run_sdk_attempt(
+        self,
+        *,
+        process,
+        prompt,
+        output_path,
+        profile_name,
+        options,
+        read_paths,
+        write_paths,
+        output_schema_path,
+    ):
+        sdk = _import_openai_codex()
+        config_overrides = []
+        if options.reasoning_effort:
+            config_overrides.append(
+                f"model_reasoning_effort={_toml_string(options.reasoning_effort)}"
+            )
+        if options.ignore_global_context:
+            config_overrides.append("project_doc_max_bytes=0")
+            config_overrides.append("skills.include_instructions=false")
+        elif options.allowed_skills == []:
+            config_overrides.append("skills.include_instructions=false")
+        if not options.allow_shell_commands:
+            config_overrides.append("features.shell_tool=false")
+            config_overrides.append("allow_login_shell=false")
+        filesystem_profile = _filesystem_inline_table(
+            options.cwd,
+            read_paths,
+            write_paths,
+        )
+        config_overrides.extend(
+            [
+                f"default_permissions={_toml_string(profile_name)}",
+                f"permissions.{profile_name}.filesystem={filesystem_profile}",
+            ]
+        )
+
+        sdk_config = sdk.CodexConfig(
+            config_overrides=tuple(config_overrides),
+            cwd=str(options.cwd),
+            env=dict(self.env),
+        )
+        sandbox = sdk.Sandbox.workspace_write if write_paths else sdk.Sandbox.read_only
+        output_schema = _load_output_schema_json(output_schema_path)
+
+        stderr_lines = []
+        returncode = 0
+        codex = None
+        try:
+            codex = sdk.Codex(config=sdk_config)
+            process.set_codex(codex)
+            thread = codex.thread_start(
+                cwd=str(options.cwd),
+                model=options.model,
+                developer_instructions=None,
+                ephemeral=options.ephemeral,
+                sandbox=sandbox,
+            )
+            turn = thread.turn(
+                prompt,
+                cwd=str(options.cwd),
+                model=options.model,
+                effort=options.reasoning_effort,
+                output_schema=output_schema,
+                sandbox=sandbox,
+            )
+            process.set_turn_handle(turn)
+            if hasattr(turn, "stream"):
+                stdout, final_response, usage, items = _consume_turn_via_stream(process, turn)
+            else:
+                stdout_lines = []
+                started_line = json.dumps({"type": "thread.started"})
+                stdout_lines.append(started_line)
+                result = turn.run()
+                final_response = result.final_response or ""
+                items = result.items
+                usage = _normalize_sdk_usage(result.usage)
+                for item in items:
+                    item_payload = getattr(item, "root", item)
+                    item_type = getattr(item_payload, "type", None)
+                    if not isinstance(item_type, str):
+                        item_type = type(item_payload).__name__
+                    item_text = _stream_item_text(item_payload)
+                    item_event = {"type": "item.completed", "item_type": item_type}
+                    if item_text:
+                        item_event["item_text"] = item_text
+                    stdout_lines.append(json.dumps(item_event))
+                if usage is not None:
+                    stdout_lines.append(json.dumps({"type": "turn.completed", "usage": usage}))
+                else:
+                    stdout_lines.append(json.dumps({"type": "turn.completed"}))
+                stdout = "\n".join(stdout_lines) + ("\n" if stdout_lines else "")
+            if process.terminated():
+                return "", "", 1
+            output_path.write_text(final_response, encoding="utf-8")
+        except Exception as exc:
+            returncode = 1
+            stderr_lines.append(traceback.format_exc().rstrip())
+        finally:
+            if codex is not None:
+                try:
+                    codex.close()
+                except Exception:
+                    pass
+        return stdout if "stdout" in locals() else "", "\n".join(stderr_lines), returncode
+
+    def _run_sdk_review_session_turn(
+        self,
+        *,
+        review_config,
+        options,
+        read_paths,
+        profile_name,
+        message,
+        history,
+        output_schema_path,
+        activity_callback,
+        sdk_state,
+        lock,
+    ):
+        sdk = _import_openai_codex()
+        config_overrides = []
+        if options.reasoning_effort:
+            config_overrides.append(
+                f"model_reasoning_effort={_toml_string(options.reasoning_effort)}"
+            )
+        if options.ignore_global_context:
+            config_overrides.append("project_doc_max_bytes=0")
+            config_overrides.append("skills.include_instructions=false")
+        elif options.allowed_skills == []:
+            config_overrides.append("skills.include_instructions=false")
+        if not options.allow_shell_commands:
+            config_overrides.append("features.shell_tool=false")
+            config_overrides.append("allow_login_shell=false")
+        filesystem_profile = _filesystem_inline_table(
+            options.cwd,
+            read_paths,
+            [],
+        )
+        config_overrides.extend(
+            [
+                f"default_permissions={_toml_string(profile_name)}",
+                f"permissions.{profile_name}.filesystem={filesystem_profile}",
+            ]
+        )
+        with lock:
+            codex = sdk_state["codex"]
+            thread = sdk_state["thread"]
+            if codex is None or thread is None:
+                sdk_config = sdk.CodexConfig(
+                    config_overrides=tuple(config_overrides),
+                    cwd=str(options.cwd),
+                    env=dict(self.env),
+                )
+                codex = sdk.Codex(config=sdk_config)
+                thread = codex.thread_start(
+                    cwd=str(options.cwd),
+                    model=options.model,
+                    developer_instructions=_build_review_session_developer_instructions(
+                        review_config.instructions
+                    ),
+                    ephemeral=options.ephemeral,
+                    sandbox=sdk.Sandbox.read_only,
+                )
+                sdk_state["codex"] = codex
+                sdk_state["thread"] = thread
+        stderr_lines = []
+        stdout_lines = []
+        turn_input = _build_review_session_turn_input(
+            history=history,
+            message=message,
+        )
+        live_streamed = False
+        try:
+            turn = thread.turn(
+                turn_input,
+                cwd=str(options.cwd),
+                model=options.model,
+                effort=options.reasoning_effort,
+                output_schema=_load_output_schema_json(output_schema_path),
+                sandbox=sdk.Sandbox.read_only,
+            )
+            if hasattr(turn, "stream"):
+                process = None
+                if activity_callback is not None:
+                    process = _ActivityStreamEmitter(activity_callback)
+                    live_streamed = True
+                stdout, final_response, usage, _items = _consume_turn_via_stream(process=process, turn=turn)
+            else:
+                started_line = json.dumps({"type": "thread.started"})
+                stdout_lines.append(started_line)
+                result = turn.run()
+                final_response = result.final_response or ""
+                for item in result.items:
+                    item_payload = getattr(item, "root", item)
+                    item_type = getattr(item_payload, "type", None)
+                    if not isinstance(item_type, str):
+                        item_type = type(item_payload).__name__
+                    item_text = _stream_item_text(item_payload)
+                    item_event = {"type": "item.completed", "item_type": item_type}
+                    if item_text:
+                        item_event["item_text"] = item_text
+                    stdout_lines.append(json.dumps(item_event))
+                usage = _normalize_sdk_usage(result.usage)
+                if usage is not None:
+                    stdout_lines.append(json.dumps({"type": "turn.completed", "usage": usage}))
+                else:
+                    stdout_lines.append(json.dumps({"type": "turn.completed"}))
+                stdout = "\n".join(stdout_lines) + ("\n" if stdout_lines else "")
+            return CodexResponse(
+                content=final_response,
+                returncode=0,
+                stdout=stdout,
+                stderr="",
+                argv=tuple(
+                    self._build_sdk_argv(
+                        profile_name=profile_name,
+                        options=options,
+                        read_paths=read_paths,
+                        write_paths=[],
+                        output_schema_path=output_schema_path,
+                    )
+                ),
+                usage=usage,
+                pricing=_copy_optional_pricing(_resolve_model_pricing(options.model)),
+                estimated_cost_usd=_estimate_cost_usd_for_usage(
+                    usage=usage,
+                    pricing=_resolve_model_pricing(options.model),
+                ),
+                files={},
+                activity_log=(),
+            )
+        except Exception as exc:
+            stderr_lines.append(traceback.format_exc().rstrip())
+            raise CodexExecutionError(
+                "codex review job exited with status 1"
+                + ("\nstderr:\n" + "\n".join(stderr_lines) if stderr_lines else ""),
+                returncode=1,
+                stdout="\n".join(stdout_lines) + ("\n" if stdout_lines else ""),
+                stderr="\n".join(stderr_lines),
+                argv=self._build_sdk_argv(
+                    profile_name=profile_name,
+                    options=options,
+                    read_paths=read_paths,
+                    write_paths=[],
+                    output_schema_path=output_schema_path,
+                ),
+            )
 
 
 def _build_prompt(
@@ -1623,6 +2312,703 @@ def _copy_optional_usage(usage):
     if usage is None:
         return None
     return dict(usage)
+
+
+def _copy_optional_pricing(pricing):
+    if pricing is None:
+        return None
+    return dict(pricing)
+
+
+def _resolve_model_pricing(model):
+    if not isinstance(model, str) or not model.strip():
+        return None
+    rates = _MODEL_PRICING_USD_PER_MILLION.get(model.strip())
+    if rates is None:
+        return None
+    pricing = {"model": model.strip(), "source_url": _API_PRICING_SOURCE_URL}
+    pricing["input_usd_per_million"] = rates["input"]
+    if rates["cached_input"] is not None:
+        pricing["cached_input_usd_per_million"] = rates["cached_input"]
+    pricing["output_usd_per_million"] = rates["output"]
+    return pricing
+
+
+def _estimate_cost_usd_for_usage(*, usage, pricing):
+    if usage is None or pricing is None:
+        return None
+    input_tokens = usage.get("input_tokens", 0)
+    cached_input_tokens = usage.get("cached_input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    reasoning_output_tokens = usage.get("reasoning_output_tokens", 0)
+    output_billed_tokens = output_tokens + reasoning_output_tokens
+    input_cost = input_tokens * float(pricing["input_usd_per_million"]) / 1_000_000
+    cached_input_rate = float(pricing.get("cached_input_usd_per_million", 0.0))
+    cached_input_cost = cached_input_tokens * cached_input_rate / 1_000_000
+    output_cost = output_billed_tokens * float(pricing["output_usd_per_million"]) / 1_000_000
+    return input_cost + cached_input_cost + output_cost
+
+
+def _format_usage_summary(*, model, usage):
+    parts = []
+    if isinstance(model, str) and model.strip():
+        parts.append(f"model={model.strip()}")
+    for key in (
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    ):
+        value = usage.get(key)
+        if isinstance(value, int):
+            parts.append(f"{key}={value}")
+    pricing = _resolve_model_pricing(model)
+    if pricing is not None:
+        parts.append(
+            "usd_per_million="
+            + "input:"
+            + str(pricing["input_usd_per_million"])
+            + ",cached_input:"
+            + str(pricing.get("cached_input_usd_per_million", 0.0))
+            + ",output:"
+            + str(pricing["output_usd_per_million"])
+        )
+        estimated_cost_usd = _estimate_cost_usd_for_usage(usage=usage, pricing=pricing)
+        if estimated_cost_usd is not None:
+            parts.append(f"estimated_cost_usd={estimated_cost_usd:.6f}")
+    return " ".join(parts)
+
+
+def _response_model_name(response):
+    if response is None:
+        return None
+    pricing = getattr(response, "pricing", None)
+    if isinstance(pricing, dict):
+        model = pricing.get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    return _model_name_from_argv(getattr(response, "argv", ()))
+
+
+def _model_name_from_argv(argv):
+    for index, token in enumerate(argv):
+        if token == "--model" and index + 1 < len(argv):
+            model = argv[index + 1]
+            if isinstance(model, str) and model.strip():
+                return model.strip()
+    return None
+
+
+def _emit_activity_stdout(entry):
+    sys.stdout.write(_format_activity_stdout(entry) + "\n")
+    sys.stdout.flush()
+
+
+def _stream_item_text(item):
+    item_type = getattr(item, "type", None)
+    if item_type == "agentMessage":
+        return _summarize_agent_message_text(getattr(item, "text", ""))
+    if item_type == "reasoning":
+        summary = _extract_reasoning_text(getattr(item, "summary", None))
+        if summary:
+            return _truncate_activity_text(summary)
+        content = _extract_reasoning_text(getattr(item, "content", None))
+        if content:
+            return _truncate_activity_text(content)
+    if item_type == "webSearch":
+        return _truncate_activity_text(_describe_web_search(item))
+    if item_type == "mcpToolCall":
+        return _truncate_activity_text(_describe_mcp_tool_call(item))
+    if item_type == "fileChange":
+        return _truncate_activity_text(_describe_file_change(item))
+    return ""
+
+
+def _extract_reasoning_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            text = _extract_reasoning_text(item)
+            if text:
+                parts.append(text)
+        return " ".join(parts)
+    text = getattr(value, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text
+    summary_text = getattr(value, "summary_text", None)
+    if isinstance(summary_text, str) and summary_text.strip():
+        return summary_text
+    if isinstance(value, dict):
+        for key in ("text", "summary_text", "summaryText", "content"):
+            text = _extract_reasoning_text(value.get(key))
+            if text:
+                return text
+    return str(value) if isinstance(value, (int, float)) else ""
+
+
+def _describe_web_search(item):
+    action = getattr(item, "action", None)
+    action_root = getattr(action, "root", action)
+    action_type = getattr(action_root, "type", None)
+    if action_type == "search":
+        query = getattr(action_root, "query", None)
+        if isinstance(query, str) and query.strip():
+            return f"search {query}"
+        queries = getattr(action_root, "queries", None) or []
+        if queries:
+            return "search " + ", ".join(str(part) for part in queries[:3] if part)
+    if action_type == "openPage":
+        url = getattr(action_root, "url", None)
+        if isinstance(url, str) and url.strip():
+            return f"open {url}"
+    if action_type == "findInPage":
+        pattern = getattr(action_root, "pattern", None)
+        url = getattr(action_root, "url", None)
+        if isinstance(pattern, str) and pattern.strip() and isinstance(url, str) and url.strip():
+            return f"find {pattern} in {url}"
+        if isinstance(pattern, str) and pattern.strip():
+            return f"find {pattern}"
+    query = getattr(item, "query", None)
+    if isinstance(query, str) and query.strip():
+        return f"query {query}"
+    return ""
+
+
+def _summarize_agent_message_text(text):
+    if not isinstance(text, str):
+        return ""
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return _truncate_activity_text(stripped)
+    if isinstance(payload, dict):
+        parts = []
+        company_name = payload.get("company_name")
+        if isinstance(company_name, str) and company_name.strip():
+            parts.append(f"company_name={company_name.strip()}")
+        verdict = payload.get("verdict")
+        if isinstance(verdict, str) and verdict.strip():
+            parts.append(f"verdict={verdict.strip()}")
+        references = payload.get("references")
+        if isinstance(references, list):
+            parts.append(f"references={len(references)}")
+        if not parts:
+            keys = [str(key) for key in list(payload.keys())[:5]]
+            if keys:
+                parts.append("keys=" + ", ".join(keys))
+        return _truncate_activity_text("JSON response " + ", ".join(parts))
+    if isinstance(payload, list):
+        return _truncate_activity_text(f"JSON response items={len(payload)}")
+    return _truncate_activity_text(stripped)
+
+
+def _describe_mcp_tool_call(item):
+    server = getattr(item, "server", None)
+    tool = getattr(item, "tool", None)
+    status = getattr(item, "status", None)
+    result = getattr(item, "result", None)
+    details = []
+    if isinstance(server, str) and server:
+        details.append(server)
+    if isinstance(tool, str) and tool:
+        details.append(tool)
+    if isinstance(status, str) and status:
+        details.append(status)
+    result_text = _extract_tool_result_text(result)
+    if result_text:
+        details.append(result_text)
+    return " ".join(details)
+
+
+def _extract_tool_result_text(result):
+    if result is None:
+        return ""
+    content = getattr(result, "content", None)
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text)
+                    continue
+                inner = item.get("content")
+                text = _extract_reasoning_text(inner)
+                if text:
+                    parts.append(text)
+        if parts:
+            return " ".join(parts[:2])
+    structured = getattr(result, "structured_content", None)
+    if structured:
+        return _summarize_mapping(structured)
+    return ""
+
+
+def _describe_file_change(item):
+    changes = getattr(item, "changes", None) or []
+    paths = []
+    for change in changes:
+        path = getattr(change, "path", None)
+        kind = getattr(change, "kind", None)
+        if isinstance(path, str) and path:
+            if isinstance(kind, str) and kind:
+                paths.append(f"{kind}:{path}")
+            else:
+                paths.append(path)
+    status = getattr(item, "status", None)
+    parts = []
+    if isinstance(status, str) and status:
+        parts.append(status)
+    if paths:
+        preview = ", ".join(paths[:3])
+        if len(paths) > 3:
+            preview += f" (+{len(paths) - 3})"
+        parts.append(preview)
+    return " ".join(parts)
+
+
+def _summarize_mapping(value):
+    if isinstance(value, dict):
+        parts = []
+        for key, item in list(value.items())[:3]:
+            if isinstance(item, (str, int, float)) and not isinstance(item, bool):
+                parts.append(f"{key}={item}")
+            else:
+                parts.append(str(key))
+        return ", ".join(parts)
+    return ""
+
+
+def _truncate_activity_text(text, *, limit=240):
+    if not isinstance(text, str):
+        return ""
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _stdout_field_text(text):
+    if not isinstance(text, str):
+        return '""'
+    normalized = " ".join(text.split())
+    escaped = normalized.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _format_activity_stdout(entry):
+    if entry.phase == "stream":
+        return _format_stream_activity_stdout(entry)
+    if entry.phase == "review" and entry.event == "input_json":
+        return f"[Reviewer][Input JSON]\n{entry.message}"
+
+    actor = _activity_actor(entry.phase)
+    kind = _non_stream_kind(entry)
+    parts = [f"[{actor}][{kind}]"]
+    if entry.attempt is not None:
+        parts.append(f"attempt={entry.attempt}")
+    if entry.repair_index is not None:
+        parts.append(f"repair={entry.repair_index}")
+    if entry.returncode is not None:
+        parts.append(f"returncode={entry.returncode}")
+    summary = _non_stream_summary(entry)
+    if summary:
+        parts.append(summary)
+    if _needs_explicit_message(entry):
+        parts.append(_stdout_field_text(entry.message))
+    return " ".join(parts)
+
+
+def _format_stream_activity_stdout(entry):
+    try:
+        event = json.loads(entry.stdout) if entry.stdout else {}
+    except json.JSONDecodeError:
+        event = {}
+    event_type = event.get("type")
+    actor = _stream_actor(entry)
+    if event_type == "item.completed":
+        item_type = event.get("item_type", "?")
+        item_text = event.get("item_text")
+        parts = [f"[{actor}][{_stream_item_label(item_type)}]"]
+        if isinstance(item_text, str) and item_text:
+            parts.append(_stdout_field_text(item_text))
+        return " ".join(parts)
+    if event_type == "item.delta":
+        item_type = event.get("item_type", "?")
+        delta_text = event.get("delta_text")
+        parts = [f"[{actor}][{_stream_item_label(item_type)}]"]
+        if isinstance(delta_text, str) and delta_text:
+            parts.append(_stdout_field_text(delta_text))
+        return " ".join(parts)
+    if event_type == "plan.updated":
+        summary = event.get("summary")
+        parts = [f"[{actor}][Plan]"]
+        if isinstance(summary, str) and summary:
+            parts.append(_stdout_field_text(summary))
+        return " ".join(parts)
+    if event_type == "thread.started":
+        return f"[{actor}][Start]"
+    if event_type == "turn.completed":
+        return f"[{actor}][Result]"
+    parts = [f"[{actor}][{_stream_event_kind(entry)}]"]
+    fallback = _stream_fallback_summary(entry)
+    if fallback:
+        parts.append(fallback)
+    parts.append(_stdout_field_text(entry.message))
+    return " ".join(parts)
+
+
+def _activity_actor(phase):
+    return {
+        "main_attempt": "Main Attempt",
+        "validator": "Validator",
+        "review": "Reviewer",
+        "repair": "Repair",
+        "file_collection": "File Collection",
+        "cleanup": "Cleanup",
+        "cancel": "Cancel",
+        "timeout": "Timeout",
+    }.get(phase, phase.replace("_", " ").title())
+
+
+def _stream_actor(entry):
+    origin = getattr(entry, "detail", None)
+    if origin == "review":
+        return "Reviewer"
+    if origin == "validator":
+        return "Validator"
+    return "Main Attempt"
+
+
+def _non_stream_kind(entry):
+    if entry.event == "usage":
+        return "Usage"
+    if entry.event == "detail":
+        return "Message"
+    if entry.phase == "main_attempt":
+        if entry.event == "error" or "exited with status" in entry.message:
+            return "Error"
+        if entry.attempt and entry.attempt > 0:
+            return "Repair"
+        return _event_kind(entry.event)
+    if entry.phase in {"validator", "review", "repair", "file_collection", "cleanup", "cancel", "timeout"}:
+        return _event_kind(entry.event)
+    return "Event"
+
+
+def _non_stream_summary(entry):
+    if entry.event == "usage":
+        return entry.message
+    if entry.phase == "cleanup":
+        if "output file cleanup" in entry.message:
+            return "output cleanup"
+        if "subcwd cleanup" in entry.message:
+            return "subcwd cleanup"
+    if entry.phase == "main_attempt":
+        if "exited with status" in entry.message:
+            return ""
+        return ""
+    if entry.phase == "validator":
+        return ""
+    if entry.phase == "review":
+        return ""
+    if entry.phase == "repair":
+        return ""
+    if entry.phase == "file_collection":
+        return ""
+    return ""
+
+
+def _event_kind(event):
+    return {
+        "start": "Start",
+        "end": "Result",
+        "error": "Error",
+        "usage": "Usage",
+    }.get(event, "Event")
+
+
+def _stream_item_label(item_type):
+    return {
+        "reasoning": "Thinking",
+        "agentMessage": "Message",
+        "webSearch": "Search",
+        "mcpToolCall": "Tool",
+        "fileChange": "Edit",
+    }.get(item_type, "Item")
+
+
+def _stream_event_kind(entry):
+    return {
+        "start": "Start",
+        "end": "Result",
+        "error": "Error",
+        "thread.started": "Start",
+        "turn.completed": "Result",
+        "item.completed": "Item",
+    }.get(entry.event, "Event")
+
+
+def _stream_fallback_summary(entry):
+    return {
+        "start": "started",
+        "end": "finished",
+        "error": "failed",
+        "thread.started": "thread started",
+        "turn.completed": "turn completed",
+        "item.completed": "item completed",
+    }.get(entry.event, entry.event)
+
+
+def _needs_explicit_message(entry):
+    if entry.phase == "stream":
+        return False
+    if entry.event == "usage":
+        return False
+    if entry.phase == "cleanup":
+        return entry.message not in {
+            "output file cleanup started",
+            "output file cleanup finished",
+            "subcwd cleanup started",
+            "subcwd cleanup finished",
+        }
+    if entry.phase == "main_attempt":
+        return entry.message not in {
+            "main attempt started",
+            "repair main attempt started",
+            "main attempt completed successfully",
+        } and "main attempt exited with status" not in entry.message
+    if entry.phase == "validator":
+        return entry.message not in {"validator started", "validator finished"}
+    if entry.phase == "review":
+        return entry.message not in {"review started", "review finished"}
+    if entry.phase == "repair":
+        return entry.message not in {
+            "repair attempt requested after validator failure",
+            "repair attempt requested after review failure",
+            "repair attempt spawned",
+        }
+    if entry.phase == "file_collection":
+        return entry.message not in {"file collection started", "file collection finished"}
+    if entry.phase == "cancel":
+        return entry.message != "job cancellation requested"
+    if entry.phase == "timeout":
+        return entry.message != "job timeout requested"
+    return True
+
+
+def _import_openai_codex():
+    try:
+        return importlib.import_module("openai_codex")
+    except ImportError as exc:
+        raise RuntimeError(
+            "openai-codex is not installed in the current Python environment"
+        ) from exc
+
+
+def _normalize_sdk_usage(usage):
+    if usage is None:
+        return None
+    values = {}
+    for key in (
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    ):
+        value = getattr(usage, key, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            values[key] = value
+    return values or None
+
+
+def _load_output_schema_json(output_schema_path):
+    if output_schema_path is None:
+        return None
+    return json.loads(output_schema_path.read_text(encoding="utf-8"))
+
+
+def _normalize_output_pydantic_model(output_pydantic_model):
+    if output_pydantic_model is None:
+        return None
+    if not callable(getattr(output_pydantic_model, "model_json_schema", None)):
+        raise ValueError(
+            "output_pydantic_model must define model_json_schema()"
+        )
+    if not callable(getattr(output_pydantic_model, "model_validate_json", None)):
+        raise ValueError(
+            "output_pydantic_model must define model_validate_json()"
+        )
+    return output_pydantic_model
+
+
+def _pydantic_model_label(model):
+    name = getattr(model, "__name__", None)
+    if isinstance(name, str) and name.strip():
+        return name
+    return str(model)
+
+
+def _render_pydantic_output_schema_json(model):
+    schema = model.model_json_schema(ref_template="#/$defs/{model}")
+    return json.dumps(schema, ensure_ascii=False, indent=2)
+
+
+def _run_pydantic_validation(*, model, content):
+    argv = ["pydantic", _pydantic_model_label(model)]
+    try:
+        model.model_validate_json(content)
+    except Exception as exc:
+        return _ValidationResult(
+            returncode=1,
+            stdout="",
+            stderr=f"pydantic validation failed for {_pydantic_model_label(model)}:\n{exc}",
+            argv=argv,
+        )
+    return _ValidationResult(
+        returncode=0,
+        stdout="",
+        stderr=f"pydantic validation passed for {_pydantic_model_label(model)}",
+        argv=argv,
+    )
+
+
+def _append_stream_event(stdout_lines, process, event):
+    line = json.dumps(event)
+    stdout_lines.append(line)
+    emit = getattr(process, "emit_stdout_line", None)
+    if emit is not None:
+        emit(line)
+
+
+def _consume_turn_via_stream(process, turn):
+    stdout_lines = []
+    items = []
+    usage = None
+    final_response_chunks = []
+    completed_turn = None
+    _append_stream_event(stdout_lines, process, {"type": "thread.started"})
+    stream = turn.stream()
+    try:
+        for event in stream:
+            method = getattr(event, "method", "")
+            payload = getattr(event, "payload", None)
+            if method in {"item/agentMessage/delta", "item.agentMessage.delta"}:
+                delta = getattr(payload, "delta", None)
+                if isinstance(delta, str) and delta:
+                    final_response_chunks.append(delta)
+                continue
+            if method in {
+                "item/reasoning/summaryTextDelta",
+                "item/reasoning/textDelta",
+                "item.reasoning.summaryTextDelta",
+                "item.reasoning.textDelta",
+            }:
+                delta = getattr(payload, "delta", None)
+                if isinstance(delta, str) and delta:
+                    _append_stream_event(
+                        stdout_lines,
+                        process,
+                        {"type": "item.delta", "item_type": "reasoning", "delta_text": delta},
+                    )
+                continue
+            if method in {"turn/plan/updated", "turn.plan.updated"}:
+                summary = _summarize_turn_plan(payload)
+                event_payload = {"type": "plan.updated"}
+                if summary:
+                    event_payload["summary"] = summary
+                _append_stream_event(stdout_lines, process, event_payload)
+                continue
+            if method in {"item/completed", "item.completed"}:
+                item = getattr(payload, "item", None)
+                if item is None:
+                    continue
+                items.append(item)
+                item_payload = getattr(item, "root", item)
+                item_type = getattr(item_payload, "type", None)
+                if not isinstance(item_type, str):
+                    item_type = type(item_payload).__name__
+                item_text = _stream_item_text(item_payload)
+                event_payload = {"type": "item.completed", "item_type": item_type}
+                if item_text:
+                    event_payload["item_text"] = item_text
+                _append_stream_event(stdout_lines, process, event_payload)
+                continue
+            if method in {"thread/tokenUsage/updated", "thread.tokenUsage.updated"}:
+                usage = _normalize_sdk_usage(
+                    getattr(payload, "token_usage", getattr(payload, "tokenUsage", None))
+                )
+                continue
+            if method in {"turn/completed", "turn.completed"}:
+                completed_turn = getattr(payload, "turn", None)
+                event_payload = {"type": "turn.completed"}
+                if usage is not None:
+                    event_payload["usage"] = usage
+                _append_stream_event(stdout_lines, process, event_payload)
+                continue
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
+
+    if completed_turn is None:
+        raise RuntimeError("turn completed event not received")
+    _raise_for_failed_sdk_turn(completed_turn)
+    final_response = _final_response_from_stream(items, final_response_chunks)
+    return (
+        "\n".join(stdout_lines) + ("\n" if stdout_lines else ""),
+        final_response,
+        usage,
+        items,
+    )
+
+
+def _raise_for_failed_sdk_turn(turn):
+    status = getattr(turn, "status", None)
+    status_value = getattr(status, "value", status)
+    if status_value != "failed":
+        return
+    error = getattr(turn, "error", None)
+    message = getattr(error, "message", None)
+    if isinstance(message, str) and message:
+        raise RuntimeError(message)
+    raise RuntimeError(f"turn failed with status {status_value}")
+
+
+def _final_response_from_stream(items, delta_chunks):
+    for item in reversed(items):
+        item_payload = getattr(item, "root", item)
+        if getattr(item_payload, "type", None) != "agentMessage":
+            continue
+        text = getattr(item_payload, "text", None)
+        if isinstance(text, str):
+            return text
+    return "".join(delta_chunks)
+
+
+def _summarize_turn_plan(payload):
+    explanation = getattr(payload, "explanation", None)
+    if isinstance(explanation, str) and explanation.strip():
+        return _truncate_activity_text(explanation)
+    plan = getattr(payload, "plan", None) or []
+    steps = []
+    for step in plan[:3]:
+        step_text = getattr(step, "step", None)
+        if isinstance(step_text, str) and step_text.strip():
+            steps.append(step_text.strip())
+    return _truncate_activity_text(" / ".join(steps))
 
 
 def _xml_attr(value):
@@ -1908,6 +3294,13 @@ def _parse_review_output(content, *, stdout, stderr, argv):
     }
 
 
+def _review_failure_message(review):
+    summary = review.summary.strip() if isinstance(review.summary, str) else ""
+    if summary:
+        return f"codex review reported issues: {summary}"
+    return "codex review reported issues"
+
+
 def _normalize_path(raw, cwd, *, must_exist):
     path = pathlib.Path(raw).expanduser()
     if not path.is_absolute():
@@ -1981,6 +3374,31 @@ def _make_output_path():
     return output_path
 
 
+def _prepare_job_log_path(log_dir, job_id, *, log_path=None):
+    if log_path is not None:
+        path = pathlib.Path(log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
+    if log_dir is None:
+        return None
+    directory = pathlib.Path(log_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    return str(directory / f"{job_id}.log")
+
+
+def _format_review_response_for_log(content):
+    if not isinstance(content, str):
+        return ""
+    stripped = content.strip()
+    if not stripped:
+        return ""
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return stripped
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def _make_temp_text_file(*, prefix, suffix, text):
     handle = tempfile.NamedTemporaryFile(
         prefix=prefix,
@@ -2009,14 +3427,28 @@ def _terminate_process_object(process):
         pass
 
 
+def _extract_checklist_feedback(validation):
+    if validation is None:
+        return ""
+    stderr = validation.stderr or ""
+    marker = "workflow checklist is incomplete:"
+    if marker not in stderr:
+        return ""
+    return stderr.split(marker, 1)[1].strip()
+
+
 def _default_repair_prompt(values):
+    stage = values["failure_stage"]
     parts = [
-        "The previous output failed validation.",
+        "The previous output failed validation or review.",
         "Do not broaden the task. Correct the previous output so it satisfies "
-        "the validator error.",
+        "the reported failure feedback.",
         "",
         "Original request:",
         values["original_input"],
+        "",
+        "Failure stage:",
+        stage,
         "",
         "Attempt:",
         values["attempt"],
@@ -2036,6 +3468,8 @@ def _default_repair_prompt(values):
         "Previous final response:",
         values["previous_content"],
     ]
+    if values["checklist_feedback"]:
+        parts.extend(["", "Incomplete checklist items:", values["checklist_feedback"]])
     if values["review_summary"]:
         parts.extend(["", "Review summary:", values["review_summary"]])
     if values["review_repair_text"]:
@@ -2077,6 +3511,64 @@ def _default_review_prompt(values):
         ]
     )
     return "\n".join(parts)
+
+
+def _build_review_session_developer_instructions(instructions):
+    return (
+        "You are the reviewer in a runner-reviewer conversation session. "
+        "Continue the conversation as the reviewer, follow the review instructions, "
+        "and answer only with the reviewer's next reply.\n\n"
+        "Review instructions:\n"
+        f"{instructions}"
+    )
+
+
+def _build_review_session_turn_input(*, history, message):
+    if not history:
+        return message
+    lines = [
+        "Conversation history:",
+    ]
+    for role, content in history:
+        label = "Runner" if role == "runner" else "Reviewer"
+        lines.extend([f"{label}:", content, ""])
+    lines.extend(["Runner:", message])
+    return "\n".join(lines)
+
+
+def _build_review_session_prompt(
+    *,
+    instructions,
+    history,
+    message,
+    ignore_global_context,
+    output_schema_path,
+):
+    sections = []
+    if ignore_global_context:
+        sections.append(
+            "Global AGENTS.md and global skills should not be used for this job. "
+            "Use only the request below and explicitly attached paths as task context."
+        )
+    sections.extend(
+        [
+            "Internal review session mode: codex_api_wrapper",
+            "Continue the conversation as the reviewer.",
+            "",
+            "Review instructions:",
+            instructions,
+            "",
+            _build_review_session_turn_input(history=history, message=message),
+        ]
+    )
+    if output_schema_path is not None:
+        output_schema_section, _ = _resolve_inline_output_schema_section(
+            output_schema_path=output_schema_path,
+            max_file_bytes=_DEFAULT_MAX_INLINE_ATTACHMENT_BYTES,
+        )
+        sections.extend(["", "Output schema:", output_schema_section])
+    sections.extend(["", "Return only the reviewer's next reply."])
+    return "\n".join(sections).strip() + "\n"
 
 
 def _path_text(path):
@@ -2130,72 +3622,6 @@ def _workspace_relative_permission_path(path, cwd):
     if not relative.parts:
         return "."
     return relative.as_posix()
-
-
-def _codex_runtime_read_paths(codex_bin):
-    executable = _resolve_executable_path(codex_bin)
-    if executable is None:
-        return []
-    if executable.parent.name == "bin":
-        return [executable.parent.parent]
-    return [executable.parent]
-
-
-def _resolve_executable_path(executable):
-    candidate = pathlib.Path(str(executable)).expanduser()
-    if not candidate.is_absolute():
-        resolved = shutil.which(str(executable))
-        if resolved is None:
-            return None
-        candidate = pathlib.Path(resolved)
-    try:
-        return candidate.resolve(strict=True)
-    except OSError:
-        return None
-
-
-def _skill_config_args(allowed_skills):
-    if allowed_skills is None:
-        return []
-    if allowed_skills == []:
-        return ["-c", "skills.include_instructions=false"]
-
-    allowed = set(allowed_skills)
-    discovered = _discover_skill_names()
-    disabled = sorted(name for name in discovered if name not in allowed)
-    args = ["-c", "skills.bundled.enabled=false"]
-    if disabled:
-        items = ",".join(
-            "{name=" + _toml_string(name) + ",enabled=false}" for name in disabled
-        )
-        args.extend(["-c", f"skills.config=[{items}]"])
-    return args
-
-
-def _discover_skill_names():
-    root = pathlib.Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "skills"
-    if not root.exists():
-        return set()
-    names = set()
-    for skill_md in root.glob("**/SKILL.md"):
-        name = _read_skill_name(skill_md)
-        if name:
-            names.add(name)
-    return names
-
-
-def _read_skill_name(skill_md):
-    try:
-        with skill_md.open("r", encoding="utf-8") as handle:
-            for _ in range(30):
-                line = handle.readline()
-                if not line:
-                    break
-                if line.startswith("name:"):
-                    return line.split(":", 1)[1].strip().strip("\"'")
-    except OSError:
-        return None
-    return skill_md.parent.name
 
 
 def _toml_string(value):
