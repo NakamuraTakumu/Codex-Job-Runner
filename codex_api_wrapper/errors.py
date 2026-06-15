@@ -2,7 +2,7 @@
 
 
 class CodexExecutionError(RuntimeError):
-    """Raised when ``codex exec`` exits with a non-zero status."""
+    """Raised when a Codex job attempt fails."""
 
     def __init__(
         self,
@@ -14,6 +14,7 @@ class CodexExecutionError(RuntimeError):
         argv=None,
         files=None,
         activity_log=None,
+        log_path=None,
     ):
         super().__init__(message)
         self.message = message
@@ -23,6 +24,7 @@ class CodexExecutionError(RuntimeError):
         self.argv = list(argv or [])
         self.files = dict(files or {})
         self.activity_log = list(activity_log or [])
+        self.log_path = log_path
 
 
 class CodexTimeoutError(CodexExecutionError):
@@ -34,7 +36,7 @@ class CodexCancelledError(CodexExecutionError):
 
 
 class CodexValidationError(CodexExecutionError):
-    """Raised when a successful ``codex exec`` result fails validation."""
+    """Raised when a successful Codex job result fails validation."""
 
     def __init__(
         self,
@@ -54,6 +56,7 @@ class CodexValidationError(CodexExecutionError):
         review_stderr="",
         review_argv=None,
         activity_log=None,
+        log_path=None,
     ):
         super().__init__(
             message,
@@ -63,6 +66,7 @@ class CodexValidationError(CodexExecutionError):
             argv=validator_argv,
             files=files,
             activity_log=activity_log,
+            log_path=log_path,
         )
         self.response = response
         self.validator_returncode = validator_returncode

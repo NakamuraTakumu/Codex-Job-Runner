@@ -1,6 +1,6 @@
-"""Small Python wrapper around ``codex exec``."""
+"""Small Python wrapper around the ``openai-codex`` SDK."""
 
-from .client import CodexClient, CodexJob, ReviewConfig
+from .client import CodexClient, CodexJob, ReviewConfig, ReviewSession
 from .errors import (
     CodexCancelledError,
     CodexExecutionError,
@@ -20,4 +20,5 @@ __all__ = [
     "CodexTimeoutError",
     "CodexValidationError",
     "ReviewConfig",
+    "ReviewSession",
 ]

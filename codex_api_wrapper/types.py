@@ -32,6 +32,7 @@ class CodexActivity:
     phase: str
     event: str
     message: str
+    detail: str | None = None
     attempt: int | None = None
     repair_index: int | None = None
     argv: tuple[str, ...] = ()
@@ -44,6 +45,7 @@ class CodexActivity:
             "phase": self.phase,
             "event": self.event,
             "message": self.message,
+            "detail": self.detail,
             "attempt": self.attempt,
             "repair_index": self.repair_index,
             "argv": list(self.argv),
@@ -55,7 +57,7 @@ class CodexActivity:
 
 @dataclass(frozen=True)
 class CodexResponse:
-    """Successful ``codex exec`` result."""
+    """Successful Codex job result."""
 
     content: str
     returncode: int
@@ -63,8 +65,11 @@ class CodexResponse:
     stderr: str
     argv: tuple[str, ...] = ()
     usage: dict[str, int] | None = None
+    pricing: dict[str, float | str] | None = None
+    estimated_cost_usd: float | None = None
     files: dict[str, CodexFile] = field(default_factory=dict)
     activity_log: tuple[CodexActivity, ...] = ()
+    log_path: str | None = None
 
     def to_dict(self):
         return {
@@ -74,6 +79,9 @@ class CodexResponse:
             "stderr": self.stderr,
             "argv": list(self.argv),
             "usage": None if self.usage is None else dict(self.usage),
+            "pricing": None if self.pricing is None else dict(self.pricing),
+            "estimated_cost_usd": self.estimated_cost_usd,
             "files": {path: file.to_dict() for path, file in self.files.items()},
             "activity_log": [entry.to_dict() for entry in self.activity_log],
+            "log_path": self.log_path,
         }

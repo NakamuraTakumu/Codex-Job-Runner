@@ -12,7 +12,9 @@ import threading
 import time
 import uuid
 import json
+import hashlib
 import importlib
+import inspect
 import traceback
 from dataclasses import dataclass, replace
 from typing import Any, Iterable, Optional, Sequence
@@ -69,9 +71,12 @@ _REVIEW_OUTPUT_SCHEMA = json.dumps(
 class ReviewConfig:
     instructions: str
     prompt_path: str | None = None
+    read_paths: tuple[str, ...] | None = None
     timeout: int | float | None = _DEFAULT_REVIEW_TIMEOUT
     model: str | None = None
     reasoning_effort: str | None = None
+    reuse_session: bool = False
+    include_main_prompt: bool = False
 
 
 @dataclass(frozen=True)
@@ -110,9 +115,12 @@ class _ValidationResult:
 class _ResolvedReviewConfig:
     instructions: str
     prompt_template: str | None
+    read_paths: tuple[str, ...] | None
     timeout: int | float | None
     model: str | None
     reasoning_effort: str | None
+    reuse_session: bool
+    include_main_prompt: bool
 
 
 @dataclass(frozen=True)
@@ -130,6 +138,8 @@ class _ReviewResult:
     stdout: str
     stderr: str
     argv: list[str]
+    input_summary: str = ""
+    read_paths: tuple[pathlib.Path, ...] = ()
     stream_emitted: bool = False
 
 
@@ -153,7 +163,32 @@ class ReviewSession:
         with self._lock:
             return tuple(self._history)
 
-    def send(self, message, *, output_schema_path=None, activity_callback=None):
+    def send(self, message, *, output_schema_path=None):
+        activity_log = []
+
+        def activity_callback(line):
+            entry = _stream_activity_from_line(line, detail="review")
+            if entry is None:
+                return
+            activity_log.append(entry)
+            _emit_activity_stdout(entry)
+
+        response = self._send(
+            message,
+            output_schema_path=output_schema_path,
+            activity_callback=activity_callback,
+        )
+        if not activity_log and response.stdout:
+            for line in response.stdout.splitlines():
+                entry = _stream_activity_from_line(line, detail="review")
+                if entry is not None:
+                    activity_log.append(entry)
+                    _emit_activity_stdout(entry)
+        if activity_log:
+            return replace(response, activity_log=tuple(activity_log))
+        return response
+
+    def _send(self, message, *, output_schema_path=None, activity_callback=None):
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
         with self._lock:
@@ -307,6 +342,7 @@ class CodexJob:
         attachments,
         inline_attachment_sections,
         output_schema_section,
+        output_model_source_section,
         read_paths,
         write_paths,
         subcwd_files,
@@ -324,7 +360,7 @@ class CodexJob:
         output_schema_path=None,
         output_pydantic_model=None,
         repair_validation_failures=False,
-        max_repairs=1,
+        max_repairs=5,
         max_validator_repairs=None,
         max_review_repairs=None,
         repair_prompt_template=None,
@@ -332,15 +368,18 @@ class CodexJob:
         validator_cwd=None,
         log_dir=None,
         log_path=None,
+        review_session_cleanup=None,
     ):
         self.id = "codex_job_" + uuid.uuid4().hex
         self.log_path = _prepare_job_log_path(log_dir, self.id, log_path=log_path)
         self.argv = list(attempt.argv)
         self._spawn_attempt = spawn_attempt
         self._original_input = original_input
+        self._initial_main_prompt = attempt.prompt
         self._attachments = list(attachments)
         self._inline_attachment_sections = list(inline_attachment_sections)
         self._output_schema_section = output_schema_section
+        self._output_model_source_section = output_model_source_section
         self._read_paths = list(read_paths)
         self._write_paths = list(write_paths)
         self._subcwd_files = list(subcwd_files)
@@ -372,6 +411,7 @@ class CodexJob:
         self._repair_prompt_template = repair_prompt_template
         self._validator_env = dict(validator_env or {})
         self._validator_cwd = pathlib.Path(validator_cwd) if validator_cwd else None
+        self._review_session_cleanup = review_session_cleanup
         self._validator_process = None
         self._lock = threading.RLock()
         self._done = threading.Event()
@@ -383,7 +423,7 @@ class CodexJob:
         self._error = None
         self._activity_log = []
         if hasattr(self._process, "set_activity_callback"):
-            self._process.set_activity_callback(self._record_stream_event_line)
+            self._set_attempt_activity_callback(attempt)
         self._log_activity(
             "main_attempt",
             "start",
@@ -454,7 +494,7 @@ class CodexJob:
                 return
             self._status = _CANCELLED
         self._log_activity("cancel", "start", "job cancellation requested")
-        self._terminate_process()
+        self._terminate_process("cancel")
         self._done.wait(1)
 
     def _timeout(self):
@@ -463,7 +503,7 @@ class CodexJob:
                 return
             self._status = _TIMEOUT
         self._log_activity("timeout", "start", "job timeout requested")
-        self._terminate_process()
+        self._terminate_process("timeout")
         self._done.wait(1)
 
     def _communicate(self):
@@ -575,6 +615,12 @@ class CodexJob:
                             attempt_index=attempt.attempt_index + 1,
                             repair_index=repairs,
                         )
+                        self._log_repair_prompt_activity(
+                            prompt,
+                            failure_stage="validator",
+                            attempt=attempt.attempt_index + 1,
+                            repair_index=repairs,
+                        )
                         with self._lock:
                             if self._status in (_TIMEOUT, _CANCELLED):
                                 self._finish()
@@ -584,6 +630,7 @@ class CodexJob:
                             attempt_index=attempt.attempt_index + 1,
                             repair_index=repairs,
                         )
+                        self._set_attempt_activity_callback(attempt)
                         self._log_activity(
                             "main_attempt",
                             "start",
@@ -611,7 +658,9 @@ class CodexJob:
 
                 review_result = self._run_review(
                     response=last_response,
-                    main_prompt=attempt.prompt,
+                    main_prompt=self._initial_main_prompt,
+                    attempt_index=attempt.attempt_index,
+                    repair_index=attempt.repair_index,
                 )
                 with self._lock:
                     if self._status in (_TIMEOUT, _CANCELLED):
@@ -623,7 +672,10 @@ class CodexJob:
                     self._finish()
                     return
 
-                if review_repairs >= self._max_review_repairs:
+                if (
+                    not self._repair_validation_failures
+                    or review_repairs >= self._max_review_repairs
+                ):
                     self._set_review_error(
                         response=last_response,
                         review=review_result,
@@ -642,6 +694,12 @@ class CodexJob:
                     attempt_index=attempt.attempt_index + 1,
                     repair_index=repairs,
                 )
+                self._log_repair_prompt_activity(
+                    prompt,
+                    failure_stage="review",
+                    attempt=attempt.attempt_index + 1,
+                    repair_index=repairs,
+                )
                 with self._lock:
                     if self._status in (_TIMEOUT, _CANCELLED):
                         self._finish()
@@ -651,6 +709,7 @@ class CodexJob:
                     attempt_index=attempt.attempt_index + 1,
                     repair_index=repairs,
                 )
+                self._set_attempt_activity_callback(attempt)
                 self._log_activity(
                     "main_attempt",
                     "start",
@@ -704,7 +763,11 @@ class CodexJob:
     def _run_attempt(self, attempt):
         stdout, stderr = attempt.process.communicate(attempt.prompt)
         if not getattr(attempt.process, "emitted_stdout_lines", lambda: False)():
-            self._record_stream_events_from_stdout(stdout or "")
+            self._record_stream_events_from_stdout(
+                stdout or "",
+                attempt=attempt.attempt_index,
+                repair_index=attempt.repair_index,
+            )
         return (
             stdout,
             stderr,
@@ -868,7 +931,12 @@ class CodexJob:
                 max_file_bytes=self._max_file_bytes,
                 max_total_file_bytes=self._max_total_file_bytes,
             )
-            self._log_activity("file_collection", "end", "file collection finished")
+            total_bytes = sum(len(file.bytes) for file in files.values())
+            self._log_activity(
+                "file_collection",
+                "end",
+                f"file collection finished: files={len(files)} bytes={total_bytes}",
+            )
             return files, None
         except Exception as exc:
             self._log_activity(
@@ -1009,7 +1077,7 @@ class CodexJob:
                 if process is not None and self._validator_process is process:
                     self._validator_process = None
 
-    def _run_review(self, *, response, main_prompt):
+    def _run_review(self, *, response, main_prompt, attempt_index, repair_index):
         if self._review_runner is None or self._review_config is None:
             raise CodexExecutionError(
                 "codex review is not configured",
@@ -1022,11 +1090,15 @@ class CodexJob:
             "review",
             "start",
             "review started",
+            attempt=attempt_index,
+            repair_index=repair_index,
         )
         self._log_activity(
             "review",
-            "input_json",
+            "reviewed_response",
             _format_review_response_for_log(response.content),
+            attempt=attempt_index,
+            repair_index=repair_index,
         )
         try:
             result = self._review_runner(
@@ -1038,6 +1110,8 @@ class CodexJob:
                 stream_callback=lambda line: self._record_stream_event_line(
                     line,
                     detail="review",
+                    attempt=attempt_index,
+                    repair_index=repair_index,
                 ),
             )
         except CodexExecutionError as exc:
@@ -1045,6 +1119,8 @@ class CodexJob:
                 "review",
                 "error",
                 f"review failed: {exc.message}",
+                attempt=attempt_index,
+                repair_index=repair_index,
                 argv=exc.argv,
                 returncode=exc.returncode,
                 stdout=exc.stdout,
@@ -1056,14 +1132,42 @@ class CodexJob:
                 "review",
                 "error",
                 f"review failed before producing a result: {exc}",
+                attempt=attempt_index,
+                repair_index=repair_index,
             )
             raise
         if result.stdout and not result.stream_emitted:
-            self._record_stream_events_from_stdout(result.stdout, detail="review")
+            self._record_stream_events_from_stdout(
+                result.stdout,
+                detail="review",
+                attempt=attempt_index,
+                repair_index=repair_index,
+            )
+        if result.input_summary:
+            self._log_activity(
+                "review",
+                "input",
+                result.input_summary,
+                attempt=attempt_index,
+                repair_index=repair_index,
+            )
+        if result.read_paths:
+            self._log_activity(
+                "review",
+                "detail",
+                _format_review_read_paths_for_log(
+                    result.read_paths,
+                    subcwd_path=self._subcwd_path,
+                ),
+                attempt=attempt_index,
+                repair_index=repair_index,
+            )
         self._log_activity(
             "review",
             "end",
             "review finished",
+            attempt=attempt_index,
+            repair_index=repair_index,
             argv=result.argv,
             returncode=result.response.returncode,
             stdout=result.stdout,
@@ -1073,18 +1177,24 @@ class CodexJob:
             phase="review",
             model=_response_model_name(result.response),
             usage=result.response.usage,
+            attempt=attempt_index,
+            repair_index=repair_index,
         )
         if isinstance(result.summary, str) and result.summary.strip():
             self._log_activity(
                 "review",
                 "detail",
                 f"review summary: {result.summary.strip()}",
+                attempt=attempt_index,
+                repair_index=repair_index,
             )
         if not result.passed and isinstance(result.repair_text, str) and result.repair_text.strip():
             self._log_activity(
                 "review",
                 "detail",
                 f"review repair request: {result.repair_text.strip()}",
+                attempt=attempt_index,
+                repair_index=repair_index,
             )
         return result
 
@@ -1164,6 +1274,32 @@ class CodexJob:
             ignore_global_context=self._ignore_global_context,
             inline_attachment_sections=self._inline_attachment_sections,
             output_schema_section=self._output_schema_section,
+            output_model_source_section=self._output_model_source_section,
+        )
+
+    def _log_repair_prompt_activity(self, prompt, *, failure_stage, attempt, repair_index):
+        self._log_activity(
+            "repair",
+            "prompt",
+            _format_prompt_summary_for_log(
+                prompt,
+                prefix=f"repair prompt prepared: source={failure_stage}",
+            ),
+            attempt=attempt,
+            repair_index=repair_index,
+        )
+
+    def _set_attempt_activity_callback(self, attempt):
+        if not hasattr(attempt.process, "set_activity_callback"):
+            return
+        attempt.process.set_activity_callback(
+            lambda line, attempt_index=attempt.attempt_index, repair_index=attempt.repair_index: (
+                self._record_stream_event_line(
+                    line,
+                    attempt=attempt_index,
+                    repair_index=repair_index,
+                )
+            )
         )
 
     def _repair_subcwd_section(self):
@@ -1171,8 +1307,9 @@ class CodexJob:
             return ""
         return (
             f"Previous attempt files remain under {_SUBCWD_TOKEN}.\n"
-            "Read and update those files when needed. Write generated files under "
-            f"{_SUBCWD_TOKEN}."
+            "Read and update only the files already allowed by the job's "
+            f"read_paths/write_paths. Write generated files only to explicitly "
+            f"permitted {_SUBCWD_TOKEN} paths."
         )
 
     def _read_output_file(self, output_path):
@@ -1219,41 +1356,36 @@ class CodexJob:
             pathlib.Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
             with open(self.log_path, "a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
-        except Exception:
-            pass
+        except Exception as exc:
+            sys.stdout.write(f"[Log][Error] file log write failed: {_truncate_activity_text(str(exc))}\n")
+            sys.stdout.flush()
 
-    def _record_stream_events_from_stdout(self, stdout, *, detail=None):
+    def _record_stream_events_from_stdout(self, stdout, *, detail=None, attempt=None, repair_index=None):
         for line in stdout.splitlines():
-            self._record_stream_event_line(line, detail=detail)
+            self._record_stream_event_line(
+                line,
+                detail=detail,
+                attempt=attempt,
+                repair_index=repair_index,
+            )
 
-    def _record_stream_event_line(self, line, *, detail=None):
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            return
-        if not isinstance(event, dict):
-            return
-        event_type = event.get("type")
-        if not isinstance(event_type, str):
-            return
-        message = f"stream event observed: {event_type}"
-        if event_type in {"item.completed", "item.delta"}:
-            item_type = event.get("item_type")
-            item_text = event.get("item_text") or event.get("delta_text")
-            if isinstance(item_type, str) and isinstance(item_text, str) and item_text:
-                message = f"stream event observed: {event_type} ({item_type}): {item_text}"
-            elif isinstance(item_type, str):
-                message = f"stream event observed: {event_type} ({item_type})"
-        elif event_type == "plan.updated":
-            summary = event.get("summary")
-            if isinstance(summary, str) and summary:
-                message = f"stream event observed: plan.updated: {summary}"
-        self._log_activity(
-            "stream",
-            event_type,
-            message,
+    def _record_stream_event_line(self, line, *, detail=None, attempt=None, repair_index=None):
+        entry = _stream_activity_from_line(
+            line,
             detail=detail,
-            stdout=line,
+            attempt=attempt,
+            repair_index=repair_index,
+        )
+        if entry is None:
+            return
+        self._log_activity(
+            entry.phase,
+            entry.event,
+            entry.message,
+            detail=entry.detail,
+            attempt=entry.attempt,
+            repair_index=entry.repair_index,
+            stdout=entry.stdout,
         )
 
     def _activity_log_snapshot(self):
@@ -1268,22 +1400,47 @@ class CodexJob:
         self._cleanup_output_files()
         self._cleanup_temp_output_schema()
         self._cleanup_subcwd()
+        self._cleanup_review_session()
         self._sync_activity_log_to_outcome()
         self._done.set()
 
+    def _cleanup_review_session(self):
+        if self._review_session_cleanup is None:
+            return
+        try:
+            self._review_session_cleanup()
+        except Exception as exc:
+            self._log_activity(
+                "cleanup",
+                "error",
+                f"review session cleanup failed: {exc}",
+                stderr=str(exc),
+            )
+
     def _cleanup_output_files(self):
-        self._log_activity("cleanup", "start", "output file cleanup started")
+        self._log_activity(
+            "cleanup",
+            "start",
+            f"output file cleanup started: files={len(self._output_paths)}",
+        )
+        removed = 0
+        missing = 0
         for output_path in self._output_paths:
             try:
                 output_path.unlink()
+                removed += 1
             except FileNotFoundError:
-                pass
-        self._log_activity("cleanup", "end", "output file cleanup finished")
+                missing += 1
+        self._log_activity(
+            "cleanup",
+            "end",
+            f"output file cleanup finished: removed={removed} missing={missing}",
+        )
 
     def _cleanup_subcwd(self):
         if self._subcwd_path is None:
             return
-        self._log_activity("cleanup", "start", "subcwd cleanup started")
+        self._log_activity("cleanup", "start", f"subcwd cleanup started: path={self._subcwd_path}")
         try:
             shutil.rmtree(self._subcwd_path)
         except FileNotFoundError:
@@ -1299,25 +1456,39 @@ class CodexJob:
                 stderr=str(exc),
             )
             return
-        self._log_activity("cleanup", "end", "subcwd cleanup finished")
+        self._log_activity("cleanup", "end", f"subcwd cleanup finished: path={self._subcwd_path}")
 
     def _cleanup_temp_output_schema(self):
         if self._temp_output_schema_path is None:
             return
-        self._log_activity("cleanup", "start", "temp output schema cleanup started")
+        self._log_activity(
+            "cleanup",
+            "start",
+            f"temp output schema cleanup started: path={self._temp_output_schema_path}",
+        )
         try:
             self._temp_output_schema_path.unlink()
         except FileNotFoundError:
             pass
-        self._log_activity("cleanup", "end", "temp output schema cleanup finished")
+        self._log_activity(
+            "cleanup",
+            "end",
+            f"temp output schema cleanup finished: path={self._temp_output_schema_path}",
+        )
 
-    def _terminate_process(self):
+    def _terminate_process(self, phase):
         with self._lock:
             process = self._process
             validator_process = self._validator_process
+        targets = 1 + (1 if validator_process is not None else 0)
         self._terminate_one_process(process)
         if validator_process is not None:
             self._terminate_one_process(validator_process)
+        self._log_activity(
+            phase,
+            "end",
+            f"job termination requested for processes={targets}",
+        )
 
     def _terminate_one_process(self, process):
         _terminate_process_object(process)
@@ -1365,7 +1536,7 @@ class CodexClient:
         self.timeout = timeout
         self.ephemeral = bool(ephemeral)
         self.ignore_global_context = ignore_global_context
-        self.allowed_skills = _copy_optional_list(allowed_skills)
+        self.allowed_skills = _normalize_allowed_skills(allowed_skills)
         self.allow_shell_commands = bool(allow_shell_commands)
         self.env = dict(env or {})
         self.log_dir = pathlib.Path(log_dir).expanduser() if log_dir is not None else None
@@ -1392,7 +1563,7 @@ class CodexClient:
         output_validator=None,
         validator_timeout=30,
         repair_validation_failures=False,
-        max_repairs=1,
+        max_repairs=5,
         max_validator_repairs=None,
         max_review_repairs=None,
         repair_prompt_path=None,
@@ -1422,11 +1593,44 @@ class CodexClient:
             allowed_skills=allowed_skills,
             allow_shell_commands=allow_shell_commands,
         )
+        raw_read_paths = list(read_paths or [])
+        raw_write_paths = list(write_paths or [])
         _reject_subcwd_token(attachments or [], "attachments")
-        _reject_subcwd_token(read_paths or [], "read_paths")
         attachments = _normalize_paths(attachments or [], options.cwd, must_exist=True)
-        read_paths = _normalize_paths(read_paths or [], options.cwd, must_exist=True)
         subcwd_files = _normalize_subcwd_files(subcwd_files)
+        needs_subcwd = (
+            bool(subcwd_files)
+            or _contains_subcwd_token(raw_read_paths)
+            or _contains_subcwd_token(raw_write_paths)
+        )
+        subcwd_path = None
+        if needs_subcwd:
+            subcwd_path = _create_subcwd(options.subcwd_root)
+        try:
+            _stage_subcwd_files(subcwd_path, subcwd_files)
+            read_paths = _normalize_subcwd_paths(
+                raw_read_paths,
+                options.cwd,
+                subcwd_path,
+                must_exist=True,
+                field_name="read_paths",
+            )
+            write_paths = _normalize_subcwd_paths(
+                raw_write_paths,
+                options.cwd,
+                subcwd_path,
+                must_exist=False,
+                field_name="write_paths",
+            )
+            _ensure_staged_subcwd_files_are_accessible(
+                subcwd_path,
+                subcwd_files,
+                read_paths,
+                write_paths,
+            )
+        except Exception:
+            _cleanup_tree(subcwd_path)
+            raise
         normalized_output_pydantic_model = _normalize_output_pydantic_model(
             output_pydantic_model
         )
@@ -1447,12 +1651,20 @@ class CodexClient:
                 )
             )
             output_schema_path = temp_output_schema_path
-        output_schema_section, output_schema_inline_bytes = (
-            _resolve_inline_output_schema_section(
-                output_schema_path=output_schema_path,
-                max_file_bytes=max_inline_attachment_bytes,
+        output_model_source_section = None
+        if normalized_output_pydantic_model is not None:
+            output_model_source_section = _render_pydantic_model_source_context(
+                normalized_output_pydantic_model
             )
-        )
+        output_schema_section = None
+        output_schema_inline_bytes = 0
+        if normalized_output_pydantic_model is None:
+            output_schema_section, output_schema_inline_bytes = (
+                _resolve_inline_output_schema_section(
+                    output_schema_path=output_schema_path,
+                    max_file_bytes=max_inline_attachment_bytes,
+                )
+            )
         inline_attachment_sections = _resolve_inline_attachment_sections(
             attachments=attachments,
             inline_attachments=inline_attachments,
@@ -1485,18 +1697,6 @@ class CodexClient:
         ):
             raise ValueError("max_review_repairs must be a non-negative integer or None")
         review_config = _normalize_review_config(review, options.cwd)
-        write_paths, subcwd_path = _normalize_write_paths(
-            write_paths or [],
-            options.cwd,
-            options.subcwd_root,
-            require_subcwd=bool(subcwd_files),
-        )
-        try:
-            _stage_subcwd_files(subcwd_path, subcwd_files)
-        except Exception:
-            _cleanup_tree(subcwd_path)
-            raise
-
         prompt_subcwd_files = _prompt_subcwd_file_paths(subcwd_files)
         prompt = _build_prompt(
             input=input,
@@ -1508,6 +1708,7 @@ class CodexClient:
             ignore_global_context=options.ignore_global_context,
             inline_attachment_sections=inline_attachment_sections,
             output_schema_section=output_schema_section,
+            output_model_source_section=output_model_source_section,
         )
         profile_name = "codex_api_wrapper_" + uuid.uuid4().hex
         env = os.environ.copy()
@@ -1543,14 +1744,36 @@ class CodexClient:
                 repair_index=repair_index,
             )
 
+        review_session_cache = {"session": None}
+
+        def close_cached_review_session():
+            session = review_session_cache.get("session")
+            if session is None:
+                return
+            review_session_cache["session"] = None
+            session.close()
+
         def run_review(*, original_input, main_prompt, response, subcwd_path, review_config, stream_callback):
             review_options = self._review_options(
                 review_config=review_config,
                 options=options,
             )
-            review_read_paths = []
-            if subcwd_path is not None:
-                review_read_paths = [subcwd_path]
+            if review_config.read_paths is None:
+                review_read_paths = list(read_paths)
+            else:
+                review_read_paths = _normalize_subcwd_paths(
+                    review_config.read_paths,
+                    options.cwd,
+                    subcwd_path,
+                    must_exist=True,
+                    field_name="review.read_paths",
+                )
+            review_visible_subcwd_path = None
+            if subcwd_path is not None and any(
+                _is_relative_to(path, subcwd_path) or path == subcwd_path
+                for path in review_read_paths
+            ):
+                review_visible_subcwd_path = subcwd_path
             schema_path = pathlib.Path(
                 _make_temp_text_file(
                     prefix="codex_api_wrapper_review_",
@@ -1568,22 +1791,30 @@ class CodexClient:
                     original_input=original_input,
                     main_prompt=main_prompt,
                     response=response,
-                    subcwd_path=subcwd_path,
+                    subcwd_path=review_visible_subcwd_path,
                     review_config=review_config,
+                    review_read_paths=review_read_paths,
                 )
-                review_session = self._create_review_session(
-                    review_config=review_config,
-                    options=review_options,
-                    read_paths=review_read_paths,
-                )
+                review_session = None
+                if review_config.reuse_session:
+                    review_session = review_session_cache.get("session")
+                if review_session is None:
+                    review_session = self._create_review_session(
+                        review_config=review_config,
+                        options=review_options,
+                        read_paths=review_read_paths,
+                    )
+                    if review_config.reuse_session:
+                        review_session_cache["session"] = review_session
                 try:
-                    review_response = review_session.send(
+                    review_response = review_session._send(
                         review_input,
                         output_schema_path=schema_path,
                         activity_callback=stream_callback,
                     )
                 finally:
-                    review_session.close()
+                    if not review_config.reuse_session:
+                        review_session.close()
                 content = review_response.content
                 parsed = _parse_review_output(
                     content,
@@ -1591,6 +1822,8 @@ class CodexClient:
                     stderr=review_response.stderr,
                     argv=list(review_response.argv),
                 )
+                if review_config.reuse_session and parsed["passed"]:
+                    close_cached_review_session()
                 return _ReviewResult(
                     passed=parsed["passed"],
                     repair_text=parsed["repair_text"],
@@ -1599,6 +1832,11 @@ class CodexClient:
                     stdout=review_response.stdout,
                     stderr=review_response.stderr,
                     argv=list(review_response.argv),
+                    input_summary=_format_prompt_summary_for_log(
+                        review_input,
+                        prefix="review input prepared",
+                    ),
+                    read_paths=tuple(review_read_paths),
                     stream_emitted=True,
                 )
             finally:
@@ -1628,6 +1866,7 @@ class CodexClient:
             attachments=attachments,
             inline_attachment_sections=inline_attachment_sections,
             output_schema_section=output_schema_section,
+            output_model_source_section=output_model_source_section,
             read_paths=read_paths,
             write_paths=write_paths,
             subcwd_files=prompt_subcwd_files,
@@ -1653,6 +1892,7 @@ class CodexClient:
             validator_cwd=options.cwd,
             log_dir=(self.log_dir or options.cwd / ".codex-job-runner-logs"),
             log_path=normalized_log_path,
+            review_session_cleanup=close_cached_review_session,
         )
         job._temp_output_schema_path = temp_output_schema_path
         return job
@@ -1789,9 +2029,9 @@ class CodexClient:
             else self.ignore_global_context
         )
         if allowed_skills is None:
-            resolved_allowed_skills = _copy_optional_list(self.allowed_skills)
+            resolved_allowed_skills = _normalize_allowed_skills(self.allowed_skills)
         else:
-            resolved_allowed_skills = _copy_optional_list(allowed_skills)
+            resolved_allowed_skills = _normalize_allowed_skills(allowed_skills)
         if resolved_ignore and resolved_allowed_skills is None:
             resolved_allowed_skills = []
         if allow_shell_commands is None:
@@ -1842,10 +2082,14 @@ class CodexClient:
             argv.extend(["-c", "allow_login_shell=false"])
         if options.allowed_skills == []:
             argv.extend(["-c", "skills.include_instructions=false"])
+        extra_read_paths = (
+            _codex_runtime_read_paths() if options.allow_shell_commands else []
+        )
         filesystem_profile = _filesystem_inline_table(
             options.cwd,
             read_paths,
             write_paths,
+            extra_read_paths=extra_read_paths,
         )
         argv.extend(
             [
@@ -1883,10 +2127,14 @@ class CodexClient:
         if not options.allow_shell_commands:
             config_overrides.append("features.shell_tool=false")
             config_overrides.append("allow_login_shell=false")
+        extra_read_paths = (
+            _codex_runtime_read_paths() if options.allow_shell_commands else []
+        )
         filesystem_profile = _filesystem_inline_table(
             options.cwd,
             read_paths,
             write_paths,
+            extra_read_paths=extra_read_paths,
         )
         config_overrides.extend(
             [
@@ -1900,7 +2148,7 @@ class CodexClient:
             cwd=str(options.cwd),
             env=dict(self.env),
         )
-        sandbox = sdk.Sandbox.workspace_write if write_paths else sdk.Sandbox.read_only
+        sandbox = _sdk_sandbox_for_permissions(sdk, write_paths)
         output_schema = _load_output_schema_json(output_schema_path)
 
         stderr_lines = []
@@ -1992,10 +2240,14 @@ class CodexClient:
         if not options.allow_shell_commands:
             config_overrides.append("features.shell_tool=false")
             config_overrides.append("allow_login_shell=false")
+        extra_read_paths = (
+            _codex_runtime_read_paths() if options.allow_shell_commands else []
+        )
         filesystem_profile = _filesystem_inline_table(
             options.cwd,
             read_paths,
             [],
+            extra_read_paths=extra_read_paths,
         )
         config_overrides.extend(
             [
@@ -2119,6 +2371,7 @@ def _build_prompt(
     ignore_global_context,
     inline_attachment_sections=None,
     output_schema_section=None,
+    output_model_source_section=None,
 ):
     sections = []
     if ignore_global_context:
@@ -2129,6 +2382,8 @@ def _build_prompt(
     sections.append(input.strip())
     if output_schema_section:
         sections.append("Output schema:\n" + output_schema_section)
+    if output_model_source_section:
+        sections.append("Output model source:\n" + output_model_source_section)
     if attachments:
         sections.append(_format_path_section("Attachments", attachments))
     if inline_attachment_sections:
@@ -2153,19 +2408,35 @@ def _build_prompt(
             "Workspace files staged under "
             f"{_SUBCWD_TOKEN}:\n"
             + "\n".join(f"- {path}" for path in subcwd_files)
-            + "\n\nThese files are pre-populated before the job starts. Read and "
-            "edit them directly when needed."
+            + "\n\nThese files are pre-populated before the job starts. "
+            "Only read or edit a staged file when the corresponding "
+            f"{_SUBCWD_TOKEN}/... path is covered by this job's read_paths "
+            "or write_paths."
         )
     return "\n\n".join(sections) + "\n"
 
 
-def _build_review_input(*, original_input, main_prompt, response, subcwd_path, review_config):
+def _build_review_input(
+    *,
+    original_input,
+    main_prompt,
+    response,
+    subcwd_path,
+    review_config,
+    review_read_paths,
+):
     values = {
         "review_instructions": review_config.instructions,
         "original_input": original_input,
-        "main_prompt": main_prompt,
+        "main_prompt": main_prompt if review_config.include_main_prompt else "",
         "response_content": response.content,
         "subcwd_path": "" if subcwd_path is None else str(subcwd_path),
+        "review_read_paths": _format_review_read_paths_for_log(
+            review_read_paths,
+            subcwd_path=subcwd_path,
+        )
+        if review_read_paths
+        else "",
     }
     if review_config.prompt_template is None:
         return _default_review_prompt(values)
@@ -2179,6 +2450,19 @@ def _format_path_section(title, paths):
     lines = [f"{title}:"]
     lines.extend(f"- {path}" for path in paths)
     return "\n".join(lines)
+
+
+def _format_review_read_paths_for_log(paths, *, subcwd_path):
+    display_paths = []
+    for path in paths:
+        if subcwd_path is not None and (path == subcwd_path or _is_relative_to(path, subcwd_path)):
+            relative = path.relative_to(subcwd_path).as_posix()
+            display_paths.append(
+                _SUBCWD_TOKEN if not relative or relative == "." else f"{_SUBCWD_TOKEN}/{relative}"
+            )
+            continue
+        display_paths.append(str(path))
+    return _format_path_section("Review readable paths", display_paths)
 
 
 def _resolve_inline_attachment_sections(
@@ -2405,6 +2689,39 @@ def _emit_activity_stdout(entry):
     sys.stdout.flush()
 
 
+def _stream_activity_from_line(line, *, detail=None, attempt=None, repair_index=None):
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    event_type = event.get("type")
+    if not isinstance(event_type, str):
+        return None
+    message = f"stream event observed: {event_type}"
+    if event_type in {"item.completed", "item.delta"}:
+        item_type = event.get("item_type")
+        item_text = event.get("item_text") or event.get("delta_text")
+        if isinstance(item_type, str) and isinstance(item_text, str) and item_text:
+            message = f"stream event observed: {event_type} ({item_type}): {item_text}"
+        elif isinstance(item_type, str):
+            message = f"stream event observed: {event_type} ({item_type})"
+    elif event_type == "plan.updated":
+        summary = event.get("summary")
+        if isinstance(summary, str) and summary:
+            message = f"stream event observed: plan.updated: {summary}"
+    return CodexActivity(
+        phase="stream",
+        event=event_type,
+        message=message,
+        detail=detail,
+        attempt=attempt,
+        repair_index=repair_index,
+        stdout=line,
+    )
+
+
 def _stream_item_text(item):
     item_type = getattr(item, "type", None)
     if item_type == "agentMessage":
@@ -2610,8 +2927,8 @@ def _stdout_field_text(text):
 def _format_activity_stdout(entry):
     if entry.phase == "stream":
         return _format_stream_activity_stdout(entry)
-    if entry.phase == "review" and entry.event == "input_json":
-        return f"[Reviewer][Input JSON]\n{entry.message}"
+    if entry.phase == "review" and entry.event == "reviewed_response":
+        return f"[Reviewer][Reviewed Response] {_stdout_field_text(entry.message)}"
 
     actor = _activity_actor(entry.phase)
     kind = _non_stream_kind(entry)
@@ -2641,6 +2958,7 @@ def _format_stream_activity_stdout(entry):
         item_type = event.get("item_type", "?")
         item_text = event.get("item_text")
         parts = [f"[{actor}][{_stream_item_label(item_type)}]"]
+        _append_activity_context_parts(parts, entry)
         if isinstance(item_text, str) and item_text:
             parts.append(_stdout_field_text(item_text))
         return " ".join(parts)
@@ -2648,25 +2966,39 @@ def _format_stream_activity_stdout(entry):
         item_type = event.get("item_type", "?")
         delta_text = event.get("delta_text")
         parts = [f"[{actor}][{_stream_item_label(item_type)}]"]
+        _append_activity_context_parts(parts, entry)
         if isinstance(delta_text, str) and delta_text:
             parts.append(_stdout_field_text(delta_text))
         return " ".join(parts)
     if event_type == "plan.updated":
         summary = event.get("summary")
         parts = [f"[{actor}][Plan]"]
+        _append_activity_context_parts(parts, entry)
         if isinstance(summary, str) and summary:
             parts.append(_stdout_field_text(summary))
         return " ".join(parts)
     if event_type == "thread.started":
-        return f"[{actor}][Start]"
+        parts = [f"[{actor}][Start]"]
+        _append_activity_context_parts(parts, entry)
+        return " ".join(parts)
     if event_type == "turn.completed":
-        return f"[{actor}][Result]"
+        parts = [f"[{actor}][Result]"]
+        _append_activity_context_parts(parts, entry)
+        return " ".join(parts)
     parts = [f"[{actor}][{_stream_event_kind(entry)}]"]
+    _append_activity_context_parts(parts, entry)
     fallback = _stream_fallback_summary(entry)
     if fallback:
         parts.append(fallback)
     parts.append(_stdout_field_text(entry.message))
     return " ".join(parts)
+
+
+def _append_activity_context_parts(parts, entry):
+    if entry.attempt is not None:
+        parts.append(f"attempt={entry.attempt}")
+    if entry.repair_index is not None:
+        parts.append(f"repair={entry.repair_index}")
 
 
 def _activity_actor(phase):
@@ -2702,7 +3034,9 @@ def _non_stream_kind(entry):
         if entry.attempt and entry.attempt > 0:
             return "Repair"
         return _event_kind(entry.event)
-    if entry.phase in {"validator", "review", "repair", "file_collection", "cleanup", "cancel", "timeout"}:
+    if entry.phase == "repair" and entry.event == "prompt":
+        return "Prompt"
+    if entry.phase in {"validator", "review", "file_collection", "cleanup", "cancel", "timeout"}:
         return _event_kind(entry.event)
     return "Event"
 
@@ -2723,8 +3057,6 @@ def _non_stream_summary(entry):
         return ""
     if entry.phase == "review":
         return ""
-    if entry.phase == "repair":
-        return ""
     if entry.phase == "file_collection":
         return ""
     return ""
@@ -2736,6 +3068,7 @@ def _event_kind(event):
         "end": "Result",
         "error": "Error",
         "usage": "Usage",
+        "input": "Input",
     }.get(event, "Event")
 
 
@@ -2793,12 +3126,6 @@ def _needs_explicit_message(entry):
         return entry.message not in {"validator started", "validator finished"}
     if entry.phase == "review":
         return entry.message not in {"review started", "review finished"}
-    if entry.phase == "repair":
-        return entry.message not in {
-            "repair attempt requested after validator failure",
-            "repair attempt requested after review failure",
-            "repair attempt spawned",
-        }
     if entry.phase == "file_collection":
         return entry.message not in {"file collection started", "file collection finished"}
     if entry.phase == "cancel":
@@ -2817,9 +3144,43 @@ def _import_openai_codex():
         ) from exc
 
 
+def _codex_runtime_read_paths():
+    try:
+        spec = importlib.util.find_spec("openai_codex")
+    except (ImportError, AttributeError, ValueError):
+        return []
+    if spec is None:
+        return []
+
+    candidate = None
+    locations = getattr(spec, "submodule_search_locations", None)
+    if locations:
+        candidate = next(iter(locations), None)
+    if candidate is None:
+        origin = getattr(spec, "origin", None)
+        if origin and origin != "built-in":
+            candidate = pathlib.Path(origin).parent
+    if candidate is None:
+        return []
+
+    try:
+        path = pathlib.Path(candidate).expanduser().resolve()
+    except OSError:
+        return []
+    if not path.exists():
+        return []
+    return [path]
+
+
 def _normalize_sdk_usage(usage):
     if usage is None:
         return None
+    breakdown = usage
+    last_breakdown = getattr(usage, "last", None)
+    if last_breakdown is not None:
+        breakdown = last_breakdown
+    elif getattr(usage, "total", None) is not None:
+        breakdown = getattr(usage, "total")
     values = {}
     for key in (
         "input_tokens",
@@ -2828,7 +3189,7 @@ def _normalize_sdk_usage(usage):
         "reasoning_output_tokens",
         "total_tokens",
     ):
-        value = getattr(usage, key, None)
+        value = getattr(breakdown, key, None)
         if isinstance(value, int) and not isinstance(value, bool):
             values[key] = value
     return values or None
@@ -2863,7 +3224,46 @@ def _pydantic_model_label(model):
 
 def _render_pydantic_output_schema_json(model):
     schema = model.model_json_schema(ref_template="#/$defs/{model}")
+    schema = _strip_structured_output_schema_metadata(schema)
     return json.dumps(schema, ensure_ascii=False, indent=2)
+
+
+def _strip_structured_output_schema_metadata(value):
+    if isinstance(value, list):
+        return [_strip_structured_output_schema_metadata(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if "$ref" in value:
+        return {"$ref": value["$ref"]}
+    stripped = {}
+    for key, item in value.items():
+        if key in {"description", "title", "examples", "default"}:
+            continue
+        if isinstance(key, str) and key.startswith("x-"):
+            continue
+        stripped[key] = _strip_structured_output_schema_metadata(item)
+    return stripped
+
+
+def _render_pydantic_model_source_context(model):
+    try:
+        source = inspect.getsource(model)
+    except (OSError, TypeError):
+        source = None
+    if not source:
+        try:
+            module = inspect.getmodule(model)
+            if module is not None:
+                source = inspect.getsource(module)
+        except (OSError, TypeError):
+            source = None
+    if not source:
+        return f"<PydanticModel name=\"{_pydantic_model_label(model)}\" />"
+    return (
+        f"<PydanticModel name=\"{_pydantic_model_label(model)}\">\n"
+        f"{source.rstrip()}\n"
+        "</PydanticModel>"
+    )
 
 
 def _run_pydantic_validation(*, model, content):
@@ -2965,6 +3365,12 @@ def _consume_turn_via_stream(process, turn):
 
     if completed_turn is None:
         raise RuntimeError("turn completed event not received")
+    if usage is None:
+        usage = _normalize_sdk_usage(getattr(completed_turn, "token_usage", None))
+    if usage is None:
+        usage = _normalize_sdk_usage(getattr(completed_turn, "tokenUsage", None))
+    if usage is None:
+        usage = _normalize_sdk_usage(getattr(completed_turn, "usage", None))
     _raise_for_failed_sdk_turn(completed_turn)
     final_response = _final_response_from_stream(items, final_response_chunks)
     return (
@@ -3051,12 +3457,20 @@ def _normalize_review_config(review, cwd):
     prompt_template = None
     if prompt_path is not None:
         prompt_template = prompt_path.read_text(encoding="utf-8")
+    normalized_read_paths = None
+    if review.read_paths is not None:
+        normalized_read_paths = tuple(_normalize_raw_path_list(review.read_paths, "review.read_paths"))
     timeout = review.timeout
     if timeout is not None and not isinstance(timeout, (int, float)):
         raise ValueError("review.timeout must be numeric or None")
+    if not isinstance(review.reuse_session, bool):
+        raise ValueError("review.reuse_session must be a bool")
+    if not isinstance(review.include_main_prompt, bool):
+        raise ValueError("review.include_main_prompt must be a bool")
     return _ResolvedReviewConfig(
         instructions=review.instructions.strip(),
         prompt_template=prompt_template,
+        read_paths=normalized_read_paths,
         timeout=timeout,
         model=review.model,
         reasoning_effort=_normalize_optional_reasoning_effort(
@@ -3064,6 +3478,8 @@ def _normalize_review_config(review, cwd):
         )
         if review.reasoning_effort is not None
         else None,
+        reuse_session=review.reuse_session,
+        include_main_prompt=review.include_main_prompt,
     )
 
 
@@ -3084,6 +3500,18 @@ def _normalize_output_validator(output_validator, cwd):
     return argv
 
 
+def _normalize_raw_path_list(paths, field_name):
+    if not isinstance(paths, (list, tuple)):
+        raise ValueError(f"{field_name} must be a list or tuple of paths")
+    normalized = []
+    for item in paths:
+        text = os.fspath(item)
+        if not isinstance(text, str) or not text:
+            raise ValueError(f"{field_name} entries must be non-empty strings")
+        normalized.append(text)
+    return normalized
+
+
 def _looks_like_path(value):
     return (
         value.startswith(".")
@@ -3092,28 +3520,6 @@ def _looks_like_path(value):
         or os.sep in value
         or (os.altsep is not None and os.altsep in value)
     )
-
-
-def _normalize_write_paths(paths, cwd, subcwd_root, *, require_subcwd=False):
-    subcwd_path = None
-    if require_subcwd or _contains_subcwd_token(paths):
-        subcwd_path = _create_subcwd(subcwd_root)
-    try:
-        normalized = []
-        for raw in paths:
-            text = _path_text(raw)
-            if _SUBCWD_TOKEN in text and not text.startswith(_SUBCWD_TOKEN):
-                raise ValueError(f"{_SUBCWD_TOKEN} must be the first path segment")
-            if text.startswith(_SUBCWD_TOKEN):
-                normalized.append(_expand_subcwd_write_path(raw, subcwd_path))
-            else:
-                normalized.append(_normalize_path(raw, cwd, must_exist=False))
-        if require_subcwd and subcwd_path is not None and subcwd_path not in normalized:
-            normalized.append(subcwd_path)
-        return normalized, subcwd_path
-    except Exception:
-        _cleanup_tree(subcwd_path)
-        raise
 
 
 def _contains_subcwd_token(paths):
@@ -3125,12 +3531,34 @@ def _reject_subcwd_token(paths, field_name):
         raise ValueError(f"{field_name} does not accept {_SUBCWD_TOKEN}")
 
 
-def _expand_subcwd_write_path(raw, subcwd_path):
+def _normalize_subcwd_paths(paths, cwd, subcwd_path, *, must_exist, field_name):
+    normalized = []
+    for raw in paths:
+        text = _path_text(raw)
+        if _SUBCWD_TOKEN in text:
+            normalized.append(
+                _expand_subcwd_path(
+                    raw,
+                    subcwd_path,
+                    field_name=field_name,
+                    allow_root=False,
+                )
+            )
+            if must_exist and not normalized[-1].exists():
+                raise FileNotFoundError(normalized[-1])
+            continue
+        normalized.append(_normalize_path(raw, cwd, must_exist=must_exist))
+    return normalized
+
+
+def _expand_subcwd_path(raw, subcwd_path, *, field_name, allow_root):
     if subcwd_path is None:
-        raise ValueError(f"{_SUBCWD_TOKEN} requires a subcwd path")
+        raise ValueError(f"{field_name} uses {_SUBCWD_TOKEN} but no subcwd was created")
     text = _path_text(raw)
     if text != _SUBCWD_TOKEN and not text.startswith(_SUBCWD_TOKEN + "/"):
         raise ValueError(f"{_SUBCWD_TOKEN} must be the first path segment")
+    if text == _SUBCWD_TOKEN and not allow_root:
+        raise ValueError(f"{field_name} does not accept bare {_SUBCWD_TOKEN}")
     suffix = text[len(_SUBCWD_TOKEN) :].lstrip("/")
     path = subcwd_path if not suffix else subcwd_path / suffix
     path = path.resolve()
@@ -3227,6 +3655,25 @@ def _stage_subcwd_files(subcwd_path, subcwd_files):
             raise ValueError(f"subcwd_files path escapes the job directory: {item.relative_path}")
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         path.write_bytes(item.data)
+
+
+def _ensure_staged_subcwd_files_are_accessible(
+    subcwd_path,
+    subcwd_files,
+    read_paths,
+    write_paths,
+):
+    if subcwd_path is None or not subcwd_files:
+        return
+    allowed_paths = list(read_paths) + list(write_paths)
+    for item in subcwd_files:
+        path = (subcwd_path / item.relative_path).resolve()
+        if any(path == allowed or _is_relative_to(path, allowed) for allowed in allowed_paths):
+            continue
+        raise ValueError(
+            "subcwd_files path must be covered by read_paths or write_paths: "
+            f"{_SUBCWD_TOKEN}/{item.relative_path}"
+        )
 
 
 def _prompt_subcwd_file_paths(subcwd_files):
@@ -3389,14 +3836,15 @@ def _prepare_job_log_path(log_dir, job_id, *, log_path=None):
 def _format_review_response_for_log(content):
     if not isinstance(content, str):
         return ""
-    stripped = content.strip()
-    if not stripped:
-        return ""
-    try:
-        payload = json.loads(stripped)
-    except json.JSONDecodeError:
-        return stripped
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    return _summarize_agent_message_text(content)
+
+
+def _format_prompt_summary_for_log(prompt, *, prefix):
+    if not isinstance(prompt, str):
+        prompt = ""
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    preview = _truncate_activity_text(prompt, limit=320)
+    return f"{prefix}: bytes={len(prompt.encode('utf-8'))} sha256={digest} preview={preview}"
 
 
 def _make_temp_text_file(*, prefix, suffix, text):
@@ -3486,7 +3934,7 @@ def _default_review_prompt(values):
     parts = [
         "Internal review mode: codex_api_wrapper",
         "Review the completed job output and determine whether it follows the "
-        "original request and the main job prompt.",
+        "original request and the review instructions.",
         "",
         "Review instructions:",
         values["review_instructions"],
@@ -3494,14 +3942,15 @@ def _default_review_prompt(values):
         "Original request:",
         values["original_input"],
         "",
-        "Main job prompt:",
-        values["main_prompt"],
-        "",
         "Main job final response:",
         values["response_content"],
     ]
+    if values["main_prompt"]:
+        parts.extend(["", "Main job prompt:", values["main_prompt"]])
     if values["subcwd_path"]:
         parts.extend(["", "Subcwd path:", values["subcwd_path"]])
+    if values["review_read_paths"]:
+        parts.extend(["", values["review_read_paths"]])
     parts.extend(
         [
             "",
@@ -3615,6 +4064,12 @@ def _filesystem_inline_table(cwd, read_paths, write_paths, extra_read_paths=None
     return "{" + ",".join(parts) + "}"
 
 
+def _sdk_sandbox_for_permissions(sdk, write_paths):
+    # The SDK sandbox is coarse. Path-level boundaries are carried by the
+    # wrapper-generated Permission Profile.
+    return sdk.Sandbox.workspace_write if write_paths else sdk.Sandbox.read_only
+
+
 def _workspace_relative_permission_path(path, cwd):
     if not _is_relative_to(path, cwd):
         raise ValueError(f"path must be inside cwd for permission profiles: {path}")
@@ -3639,7 +4094,15 @@ def _normalize_optional_reasoning_effort(value):
     return text
 
 
-def _copy_optional_list(value):
+def _normalize_allowed_skills(value):
     if value is None:
         return None
-    return list(value)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("allowed_skills must be None or []")
+    skills = list(value)
+    if not skills:
+        return []
+    raise ValueError(
+        "allowed_skills supports only None or [] in v1; use [] to disable "
+        "automatic skill instructions"
+    )

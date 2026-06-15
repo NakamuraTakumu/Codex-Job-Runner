@@ -5,11 +5,11 @@
 - Repository: none
 - Related-Commit: none
 
-Responsibility: `codex_api_wrapper` が `codex exec` の最終出力を validator script と review job で確認し、失敗時に同じ model と同じ `${SUBCWD}` を使って repair attempt を行う仕様を定義する。
+Responsibility: `codex_api_wrapper` が Codex job の最終出力を validator script と review job で確認し、失敗時に同じ model と同じ `${SUBCWD}` を使って repair attempt を行う仕様を定義する。
 
 ## Background
 
-`output_schema_path` は `codex exec --output-schema <FILE>` に渡す model 出力指定であり、wrapper 側での検証結果を保証しない。skill script や job template では、最終応答や生成 file が caller の期待する JSON、schema、domain rule、file set を満たすかを、別の validator script で確認したい場合がある。
+`output_schema_path` は SDK turn の `output_schema` に渡す model 出力指定であり、wrapper 側での検証結果を保証しない。skill script や job template では、最終応答や生成 file が caller の期待する JSON、schema、domain rule、file set を満たすかを、別の validator script で確認したい場合がある。
 
 validator だけでは、最終応答や `${SUBCWD}` 内成果物が元の依頼や wrapper prompt に本当に従っているかを十分に判断できない場合がある。そのため、validator 成功後に別の Codex review job を追加実行し、review fail 時も repair へ接続できるようにする。
 
@@ -17,13 +17,13 @@ validation failure は、別 model への fallback より先に、同じ model �
 
 ## Result
 
-**validator**: `output_validator` で指定する command。`codex exec` が exit code `0` で完了した後、wrapper が最終応答と必要な metadata を渡して実行する。
+**validator**: `output_validator` で指定する command。main attempt が exit code `0` で完了した後、wrapper が最終応答と必要な metadata を渡して実行する。
 
-**validation failure**: validator が non-zero exit code で終了した状態。`codex exec` の失敗とは区別し、`CodexValidationError` として扱う。
+**validation failure**: validator が non-zero exit code で終了した状態。main attempt 自体の失敗とは区別し、`CodexValidationError` として扱う。
 
-**repair attempt**: validation failure の後、同じ model、同じ cwd、同じ permission、同じ `${SUBCWD}` を使い、repair prompt で再度 `codex exec` を起動する attempt。
+**repair attempt**: validation failure の後、同じ model、同じ cwd、同じ permission、同じ `${SUBCWD}` を使い、repair prompt で再度 Codex job attempt を起動する attempt。
 
-**review job**: validator 成功後に wrapper が追加で起動する Codex job。`ReviewConfig` に基づき、主 job の `original_input`、主 job に実際に渡した prompt 全体、最終応答、`${SUBCWD}` を見て `passed` / `repair_text` を返す。
+**review job**: validator 成功後に wrapper が追加で起動する Codex job。`ReviewConfig` に基づき、主 job の `original_input`、最終応答、必要に応じて `${SUBCWD}` を見て `passed` / `repair_text` を返す。主 job に実際に渡した prompt 全体は `ReviewConfig(include_main_prompt=True)` の場合だけ含める。review job の read permission は `ReviewConfig.read_paths` があればそれを使い、なければ主 job の `read_paths` を流用する。
 
 **attempt group**: original attempt と repair attempts をまとめた単位。`${SUBCWD}` の lifecycle、file collection、cleanup は attempt group 単位で扱う。
 
@@ -38,7 +38,9 @@ validation failure は、別 model への fallback より先に、同じ model �
 | `output_validator` | `str | list[str] | None` | `None` | 最終出力を検証する command。`str` は単一 executable、`list[str]` は argv として扱う。 |
 | `validator_timeout` | `int | float | None` | `30` | validator subprocess の timeout 秒数。`None` は無制限。 |
 | `repair_validation_failures` | `bool` | `False` | validation failure 時に repair attempt を行う。 |
-| `max_repairs` | `int` | `1` | repair attempt の最大回数。`repair_validation_failures=False` では使わない。 |
+| `max_repairs` | `int` | `5` | repair attempt の最大回数。`repair_validation_failures=False` では使わない。 |
+| `max_validator_repairs` | `int | None` | `None` | validator failure 由来の repair 最大回数。`None` は `max_repairs` と同じ。 |
+| `max_review_repairs` | `int | None` | `None` | review failure 由来の repair 最大回数。`None` は `max_repairs` と同じ。 |
 | `repair_prompt_path` | `str | None` | `None` | repair prompt template file。未指定なら wrapper の default prompt を使う。 |
 
 `output_validator` は shell 文字列として解釈しない。wrapper は `subprocess.run(argv, shell=False, ...)` 相当で実行する。引数が必要な validator は `list[str]` で渡す。
@@ -55,6 +57,8 @@ client.run(
 `repair_prompt_path` は存在しない path を実行前に error にする。
 
 `max_repairs` は `0` 以上の整数だけを受け取る。`repair_validation_failures=True` かつ `max_repairs=0` の場合、repair は行わず validation failure を返す。これは retry を一時的に無効化するために許す。
+
+`max_validator_repairs` と `max_review_repairs` は、それぞれ validator failure と review failure の repair 回数だけを個別に絞る。未指定時は両方とも `max_repairs` を使う。
 
 ## Validator Contract
 
@@ -106,6 +110,7 @@ default repair prompt は次の情報を含める。
 - validator stderr
 - previous final response content
 - `${SUBCWD}` がある場合、その directory を再利用してよいこと
+- `${SUBCWD}` がある場合でも、既存 job の `read_paths` / `write_paths` の範囲だけを使うこと
 - final output だけを返す指示
 
 概念的な prompt:
@@ -136,7 +141,7 @@ Corrected final response only:
 
 ```text
 前回 attempt が作成した file は同じ ${SUBCWD} に残っています。
-必要ならそれらを読んで修正し、生成 file も同じ ${SUBCWD} 配下へ書いてください。
+必要なら、既存 job の read_paths / write_paths で許可された file だけを読んで修正し、生成 file も明示的に許可された ${SUBCWD} path 配下へ書いてください。
 ```
 
 `repair_prompt_path` が指定された場合、wrapper はその template を読み、上記情報を埋め込む。template 形式は実装時に単純な `{name}` placeholder 置換に留める。
@@ -145,15 +150,21 @@ Corrected final response only:
 
 1. wrapper は original attempt を通常通り起動する。
 2. original attempt が non-zero exit の場合、validation と repair は行わず `CodexExecutionError` にする。
-3. original attempt が exit code `0` で終了したら、`--output-last-message` の内容を読む。
-4. `output_validator` がなければ、既存仕様通り response を返す。
-5. validator を実行し、exit code `0` なら response を返す。
+3. original attempt が exit code `0` で終了したら、SDK turn の final response を読む。
+4. `output_validator` がなければ validator は skip する。
+5. validator を実行する場合、exit code `0` なら review 判定へ進む。
 6. validator が non-zero の場合、`repair_validation_failures` と `max_repairs` を確認する。
 7. repair しない場合、`CodexValidationError` を raise する。
-8. repair する場合、同じ model、cwd、attachments、read_paths、write_paths、permission profile、`output_schema_path`、schema context、`output_validator` を使い、repair prompt で次の attempt を起動する。
+8. repair する場合、wrapper は repair prompt の要約を activity log に記録し、同じ model、cwd、attachments、read_paths、write_paths、permission profile 相当の設定、`output_schema_path`、schema context、`output_validator` を使い、repair prompt で次の attempt を起動する。
 9. repair attempt の final response に対して validator を再実行する。
-10. validation success なら、最終 repair attempt の response を返す。
-11. `max_repairs` に達しても validation failure の場合、最後の validation result を持つ `CodexValidationError` を raise する。
+10. validation success 後、`review` がなければ response を返す。
+11. `review` がある場合、review job を実行する。
+12. review が `passed=true` を返した場合、response を返す。
+13. review が `passed=false` を返した場合、`repair_validation_failures` と `max_review_repairs` を確認する。
+14. review repair しない場合、review result を持つ `CodexValidationError` を raise する。
+15. review repair する場合、wrapper は repair prompt の要約を activity log に記録し、`repair_text` を repair prompt に入れて次の main attempt を起動する。
+16. review output parse failure や review job execution failure は `CodexExecutionError` として扱い、repair しない。
+17. `max_repairs`、`max_validator_repairs`、または `max_review_repairs` に達しても failure が残る場合、最後の validation / review result を持つ `CodexValidationError` を raise する。
 
 `CodexJob.done()` は attempt group が成功、失敗、timeout、cancel のいずれかへ到達したときに `True` になる。individual attempt の終了だけでは `done()` にしない。
 
@@ -161,7 +172,7 @@ Corrected final response only:
 
 `${SUBCWD}` が使われる場合、wrapper は attempt group 開始時に 1 つだけ subcwd を作る。repair attempt は同じ subcwd を再利用する。
 
-repair attempt は、original attempt が作成した file を読める。`write_paths` は同じ path の read access も含むため、同じ `${SUBCWD}` を `write` permission として渡せばよい。
+repair attempt は、original attempt と同じ permission profile 相当の設定を使う。そのため、original attempt が作成した file を読めるのは、既存 job の `read_paths` または `write_paths` で許可されている `${SUBCWD}/...` に限る。`write_paths` は同じ path の read access も含む。
 
 cleanup は attempt group の最後に一度だけ行う。
 
@@ -191,24 +202,26 @@ cleanup は attempt group の最後に一度だけ行う。
 | `attempts` | `int` | original attempt を含む実行 attempt 数。 |
 | `repairs` | `int` | 実行した repair attempt 数。 |
 | `files` | `dict[str, CodexFile]` | `collect_files=True` の場合に回収できた file。 |
-| `activity_log` | `list[CodexActivity]` | wrapper 側 phase log。main attempt / validator / review / repair / file collection / cleanup の start/end/error と、その時点の argv / stdout / stderr / returncode を追える。 |
+| `activity_log` | `list[CodexActivity]` | wrapper 側 phase log。main attempt / stream / validator / review / repair / file collection / cleanup の start/end/error/detail と、その時点の attempt / repair_index / argv / stdout / stderr / returncode を追える。repair attempt は `phase="main_attempt"` と `repair_index > 0` で表し、repair prompt は `phase="repair"` の要約として残す。 |
 
-validator timeout は `CodexValidationError` として扱う。`CodexTimeoutError` は `codex exec` attempt 自体の timeout にだけ使う。
+validator timeout は `CodexValidationError` として扱う。`CodexTimeoutError` は main attempt 自体の timeout にだけ使う。
 
-review subprocess failure や review output parse failure は `CodexExecutionError` として返す。これらの error も `stdout`、`stderr`、`argv`、`activity_log` を保持するため、review 側の失敗詳細が `codex exec communication failed: ...` に潰れないことを v1 の契約に含める。
+review subprocess failure や review output parse failure は `CodexExecutionError` として返す。これらの error も `stdout`、`stderr`、`argv`、`activity_log` を保持するため、review 側の失敗詳細が `codex job communication failed: ...` に潰れないことを v1 の契約に含める。
 
 ## Scope Limits
 
 別 model への fallback はこの仕様に含めない。model fallback は wrapper の外側の orchestration policy として扱う。
 
-repair は validation failure にだけ適用する。`codex exec` の non-zero exit、Popen failure、permission setup failure、attachment path 不在、schema path 不在、validator path 不在には repair を適用しない。
+repair は validation failure にだけ適用する。main attempt の non-zero exit、Popen failure、permission setup failure、attachment path 不在、schema path 不在、validator path 不在には repair を適用しない。
 
 repair は同じ model を使う。caller が別 model で再実行したい場合は、`CodexValidationError` を受け取った後に外側で新しい call を行う。
 
-stdout や JSON event の streaming validation は扱わない。wrapper は `codex exec` subprocess の終了後に `--output-last-message` を読み、それを validator に渡す。
+stdout や JSON event の streaming validation は扱わない。wrapper は turn 完了後の final response を validator に渡す。
 
-## Open Questions
+## Scope Decisions
 
-- validator に `response.files` の内容を渡す標準 method を追加するか。v1 では stdin の `content` と `${SUBCWD}` の read/write 再利用だけで始める。
-- `repair_prompt_path` template の placeholder 名を固定するか、default prompt だけを公開して template は後回しにするか。
-- validation failure 時に `collect_files=True` なら error.files を必ず回収するか、回収失敗を validation error に統合するか。
+validator stdin には `response.content` だけを渡す。v1 では `response.files` を validator stdin に同梱しない。validator が file を読む必要がある場合は、許可済みの `${SUBCWD}/...` path を使う。
+
+`repair_prompt_path` は単純な `{name}` placeholder 置換を使う。template 用の別 DSL は v1 には含めない。
+
+`collect_files=True` の場合、validation failure error には回収できた file を含める。file collection 自体が失敗した場合は validation failure に混ぜず、実行失敗として扱う。

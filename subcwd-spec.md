@@ -11,13 +11,13 @@ Responsibility: `codex_api_wrapper` の job ごとに衝突しない workspace d
 
 `response.content` で返せるのは小さい text 出力に限られる。複数 file、大きい text、binary、途中失敗時に確認したい成果物は filesystem 経由で扱う必要がある。
 
-共有された固定 output directory を使うと、並列 job や再実行で file 名が衝突しやすい。さらに、worker に入力 file のコピーを直接編集させたい場合は、job ごとに独立した workspace が必要になる。そのため、wrapper が job ごとに一意な workspace directory を `subcwd_root` 配下へ作り、`write_paths` と `subcwd_files` から実 path ではなく placeholder で参照できるようにする。
+共有された固定 output directory を使うと、並列 job や再実行で file 名が衝突しやすい。さらに、worker に入力 file のコピーを直接編集させたい場合は、job ごとに独立した workspace が必要になる。そのため、wrapper が job ごとに一意な workspace directory を `subcwd_root` 配下へ作り、`read_paths` / `write_paths` と `subcwd_files` から実 path ではなく placeholder で参照できるようにする。
 
 ## Result
 
 **subcwd**: job ごとの workspace directory。`client.start(...)` の resolved `subcwd_root` 配下に UUID 名の directory として作る。`subcwd_root` 未指定時は resolved `cwd` を使う。
 
-**作成条件**: `write_paths` に `${SUBCWD}` または `${SUBCWD}/...` が含まれる場合、または `subcwd_files` が非空の場合に作る。
+**作成条件**: `read_paths` または `write_paths` に `${SUBCWD}/...` が含まれる場合、または `subcwd_files` が非空の場合に作る。
 
 **placeholder**: public API では `${SUBCWD}` を使う。利用者は UUID directory 名を組み立てない。
 
@@ -31,8 +31,14 @@ Responsibility: `codex_api_wrapper` の job ごとに衝突しない workspace d
 
 | Value | Meaning |
 | --- | --- |
-| `"${SUBCWD}"` | job 専用 `subcwd` 全体への write permission。 |
 | `"${SUBCWD}/relative/path"` | job 専用 `subcwd` 内の相対 path への write permission。 |
+| その他の path | 既存仕様通り、`cwd` 相対または absolute path として扱う。 |
+
+`read_paths` も次の形を受け取る。
+
+| Value | Meaning |
+| --- | --- |
+| `"${SUBCWD}/relative/path"` | job 専用 `subcwd` 内の相対 path への read permission。 |
 | その他の path | 既存仕様通り、`cwd` 相対または absolute path として扱う。 |
 
 `subcwd_files` は次の形を受け取る。
@@ -42,7 +48,7 @@ Responsibility: `codex_api_wrapper` の job ごとに衝突しない workspace d
 | `{"path/in/subcwd.txt": {"text": "..."}}` | UTF-8 text などの text file を staged する。 |
 | `{"path/in/subcwd.bin": {"bytes": b"..."}}` | binary file を staged する。 |
 
-`read_paths` と `attachments` では、v1 は `${SUBCWD}` を受け取らない。`${SUBCWD}` の staged input は wrapper が専用 API と prompt 通知で扱う。
+bare な `${SUBCWD}` は `read_paths` / `write_paths` / `attachments` のいずれでも受け取らない。`${SUBCWD}` の staged input は wrapper が専用 API と prompt 通知で扱うが、実際の read/write 権限は `${SUBCWD}/...` を明示した path だけに限定する。
 
 `CodexClient(..., subcwd_root=...)` は `${SUBCWD}` を使う job の親ディレクトリを指定する。`cwd` 相対または absolute path を受け付けるが、resolved `cwd` 配下のみ許可する。`${SUBCWD}` token は受け付けない。`start(...)` と `run(...)` に per-call override は追加しない。
 
@@ -65,11 +71,11 @@ Responsibility: `codex_api_wrapper` の job ごとに衝突しない workspace d
 
 1. `client.start(...)` は `cwd` を解決する。
 2. wrapper は `subcwd_root` を解決する。未指定時は `cwd` を使う。
-3. `write_paths` に `${SUBCWD}` placeholder がある場合、または `subcwd_files` が非空の場合、`subcwd_root / <uuid>` を作成する。`subcwd_root` の親ディレクトリが未作成なら wrapper が作成する。
+3. `read_paths` または `write_paths` に `${SUBCWD}/...` placeholder がある場合、または `subcwd_files` が非空の場合、`subcwd_root / <uuid>` を作成する。`subcwd_root` の親ディレクトリが未作成なら wrapper が作成する。
 4. `subcwd_files` がある場合、wrapper は subprocess 起動前に file 実体を `${SUBCWD}` へ書き出す。
-5. wrapper は `write_paths` 内の `${SUBCWD}` を実 path に展開し、Permission Profile の `write` entry に入れる。`subcwd_files` がある job では、`write_paths` に `${SUBCWD}` がなくても `${SUBCWD}` 自体を writable path に含める。
+5. wrapper は `read_paths` / `write_paths` 内の `${SUBCWD}/...` を実 path に展開し、Permission Profile の `read` / `write` entry に入れる。`subcwd_files` がある job でも `${SUBCWD}` 権限は自動付与しない。staged file は少なくとも 1 つの `read_paths` または `write_paths` で被覆されていなければならない。
 6. wrapper は prompt に `${SUBCWD}` の path と staged file 一覧を明記する。file 内容は inline しない。
-7. subprocess 終了後、wrapper は `--output-last-message` の内容を読んで `response.content` を作る。
+7. main attempt 終了後、wrapper は SDK turn の final response から `response.content` を作る。
 8. `collect_files=True` なら、wrapper は `subcwd` 配下の通常 file を memory 上へ回収し、relative path keyed の `response.files` を作る。
 9. wrapper は `subcwd` を削除する。削除は成功、失敗、timeout、cancel のすべてで試みる。親の `subcwd_root` 自体は削除しない。
 
@@ -100,17 +106,17 @@ response.files["data.json"].json()
 placeholder を使った job では、wrapper が prompt に次の内容を追加する。
 
 ```text
-一時出力 directory:
+Temporary output directory:
 ${SUBCWD} = <resolved-subcwd-path>
 
-必要な file 編集と生成は、この directory 配下で行ってください。
-この directory 名は一時値なので、最終応答では必要がない限り説明しないでください。
+Create output files only under this directory.
+This directory name is temporary; do not mention it in the final response unless necessary.
 ```
 
-`subcwd_files` がある場合は、さらに `${SUBCWD}` 内の staged file 一覧を追加し、「事前配置済みで必要なら直接編集してよい」と明記する。
+`subcwd_files` がある場合は、さらに `${SUBCWD}` 内の staged file 一覧を追加し、「事前配置済みだが、読んだり編集したりできるのは明示的に許可された path だけ」と明記する。
 
 UUID を外部にできるだけ出さないため、利用者向け API、通常の `response.content`、README の利用例では `${SUBCWD}` を使う。実 path は permission、prompt、debug 情報にだけ現れる。
 
-## Open Questions
+## Cleanup Failure
 
-- 削除失敗を `stderr` へ追記するだけでよいか、`CodexResponse` に cleanup warning field を追加するか。
+subcwd cleanup が失敗した場合、wrapper は専用の cleanup warning field を追加しない。`stderr` に追記し、`activity_log` に cleanup error として記録する。

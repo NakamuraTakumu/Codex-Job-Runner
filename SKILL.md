@@ -1,20 +1,20 @@
 ---
 name: codex-job-runner
-description: Python から `codex exec` を使う wrapper を設計または実装するときに使う。詳細はこの skill の workflow に従う。
+description: Python から Codex SDK-backed job wrapper を設計または実装するときに使う。詳細はこの skill の workflow に従う。
 ---
 
 # Codex API Wrapper
 
 ## 目的
 
-skill、workflow、hook、または local script から `codex exec` を Python で programmatic に呼び出す必要があるときに使う。
+skill、workflow、hook、または local script から Codex job を Python で programmatic に呼び出す必要があるときに使う。
 
 この skill は、通常のユーザー向け chat delegation のためのものではない。Codex job の起動、完了待ち、最終応答の取得、job が read/write できる path の制約を行う local Python 補助 library を提供する。
 
 ## 使用場面
 
 - 1 つ以上の Codex job を起動する skill script を設計または実装する。
-- 単一の blocking な `codex exec` 呼び出しではなく、non-blocking な job handle が必要である。
+- 単一の blocking な SDK turn 実行ではなく、non-blocking な job handle が必要である。
 - attachment path、read path、write path、model、reasoning effort、cwd、timeout、または best-effort な global context 抑制を渡す必要がある。
 - 別の orchestration layer の下に置ける小さい API が必要である。
 
@@ -81,7 +81,7 @@ response = client.run(
     input="結果を JSON で返してください。",
     output_validator=["python3", "scripts/validate_result.py"],
     repair_validation_failures=True,
-    max_repairs=1,
+    max_repairs=5,
 )
 ```
 
@@ -109,22 +109,27 @@ validator の stdout / stderr は、`CodexValidationError` に保持される。
 ## 契約
 
 - 実用 API reference は `README.md` として扱う。
-- 入力、実行設定、permission、完了検知、出力取得、error の設計契約は `spec.md` として扱う。
+- 入力、出力、sandbox、failure、public API の利用者向け正本は `spec.md` として扱う。
+- job API、完了判定、timeout、cancel の詳細契約は `job-api-spec.md` として扱う。
 - `${SUBCWD}` と file collection の詳細契約は `subcwd-spec.md` として扱う。
+- sandbox、shell command、global context の詳細契約は `sandbox-spec.md` として扱う。
+- structured output と Pydantic output の詳細契約は `structured-output-spec.md` として扱う。
 - wrapper 側 validator と validation failure repair の詳細契約は `validation-repair-spec.md` として扱う。
-- public wrapper API は `start`、`run`、`wait_any`、`done`、`result`、`cancel` に留める。
+- automatic review と review session の詳細契約は `review-spec.md` として扱う。
+- logging の詳細契約は `logging-spec.md` として扱う。
+- public wrapper API は job 用の `start`、`run`、`wait_any`、`done`、`result`、`cancel` と、review session 用の `start_review_session`、`ReviewSession.send`、`ReviewSession.close`、`ReviewSession.history` に留める。
 - model の初期 context に入れたい file または directory には `attachments` を使う。通常 file attachment は既定で上限付き inline し、directory は path だけ列挙する。
-- `output_schema_path` は `codex exec --output-schema` に渡すだけでなく、schema 本文を `Output schema` section として model の初期 context にも入れる。
+- `output_schema_path` は SDK turn の `output_schema` に渡すだけでなく、schema 本文を `Output schema` section として model の初期 context にも入れる。
 - `read_paths` は content injection ではなく filesystem permission として扱う。初期 context として内容を渡す file は `attachments` に入れる。
 - filesystem permission の意図には `read_paths` と `write_paths` を使う。`write_paths` は同じ path への read access も含む。
 - `read_paths` と `write_paths` は v1 では `cwd` 配下に限定され、Permission Profile の `:workspace_roots` rule として渡される。
 - thinking / reasoning effort を指定する場合は `reasoning_effort` を使い、wrapper は Codex CLI の `model_reasoning_effort` config として渡す。
-- `allow_shell_commands=True` では、sandbox 内の command runner 用に Codex runtime directory を内部 read-only path として Permission Profile に追加する。
+- `allow_shell_commands=True` では、検出できる場合だけ sandbox 内の command runner 用 Codex runtime directory を内部 read-only path として Permission Profile に追加する。
 - shell command 実行は既定で on とし、Permission Profile の filesystem sandbox 内で `read_paths` / `write_paths` の境界に従わせる。
 - shell command を使わせない job だけ `allow_shell_commands=False` を明示する。attachments の inline 挙動は shell command 設定に依存しない。
 - command prefix ごとの allowlist / denylist は v1 API に入れず、必要なら呼び出し側が Codex CLI の rules 設定で管理する。
 - `ignore_global_context=True` は best-effort な抑制としてだけ使う。`CODEX_HOME` は変更せず、global `AGENTS.md` の完全な隠蔽は保証しない。
-- automatic skill instructions を抑制する場合は `allowed_skills=[]` を使う。使える skill を prompt 上で best-effort に制限する場合は、非空 list を渡す。
+- automatic skill instructions を抑制する場合は `allowed_skills=[]` を使う。v1 は非空 `allowed_skills` による skill allow-list を扱わず、実行前に `ValueError` にする。
 
 ## 検証
 

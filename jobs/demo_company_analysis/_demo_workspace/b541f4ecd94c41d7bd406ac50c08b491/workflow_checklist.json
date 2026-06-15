@@ -1,0 +1,10 @@
+{
+  "source_gathered": true,
+  "company_profile_checked": true,
+  "employee_count_checked": true,
+  "salary_checked": true,
+  "strengths_checked": true,
+  "risks_checked": true,
+  "references_checked": true,
+  "output_schema_checked": true
+}
