@@ -3,7 +3,7 @@ name: codex-job-runner
 description: Python から Codex SDK-backed job wrapper を設計または実装するときに使う。詳細はこの skill の workflow に従う。
 ---
 
-# Codex API Wrapper
+# Codex Job Runner
 
 ## 目的
 
@@ -15,7 +15,7 @@ skill、workflow、hook、または local script から Codex job を Python で
 
 - 1 つ以上の Codex job を起動する skill script を設計または実装する。
 - 単一の blocking な SDK turn 実行ではなく、non-blocking な job handle が必要である。
-- attachment path、read path、write path、model、reasoning effort、cwd、timeout、または best-effort な global context 抑制を渡す必要がある。
+- 初期 model context、read path、write path、model、reasoning effort、cwd、timeout、または best-effort な global context 抑制を渡す必要がある。
 - 別の orchestration layer の下に置ける小さい API が必要である。
 
 この skill を、top-level agent の直接推論やユーザー向け chat 応答の代替として使わない。task graph、一般 retry policy、worker pool、ledger、結果統合の挙動はこの wrapper に追加せず、呼び出し側で構築する。例外として、`output_validator` に失敗した同一 job の最終出力を修正する validation repair だけは、この wrapper の局所機能として扱う。
@@ -31,17 +31,15 @@ PYTHONPATH="$CODEX_HOME/skills/codex-job-runner" python path/to/script.py
 最小の Python 利用例:
 
 ```python
-from codex_api_wrapper import CodexClient
+from codex_job_runner import CodexClient
 
 client = CodexClient(
     cwd="/path/to/workspace",
-    timeout=300,
-    ignore_global_context=True,
 )
 
 job = client.start(
     input="この skill script をレビューし、問題点を報告してください。",
-    attachments=["scripts/review_skill.py"],
+    context=["scripts/review_skill.py"],
     read_paths=["scripts", "README.md"],
     write_paths=["tmp/codex-output"],
 )
@@ -56,7 +54,9 @@ print(response.content)
 
 再利用する「サブエージェント的な処理」は、正式な agent や subagent ではなく **wrapper job** として `jobs/` 配下に置く。
 
-各 job directory は、job 専用の `CodexClient` subclass を定義する。subclass の `start(...)` は job 固有の入力を受け取り、`prompt.md`、`output.schema.json`、`attachments`、`read_paths`、`write_paths`、`output_schema_path` を組み立てて `super().start(...)` に渡す。
+各 job directory は、job 専用の `CodexClient` subclass を定義する。subclass の `start(...)` は job 固有の入力を受け取り、`prompt.md` などの固定指示、参照 file、path-like context を `context` として組み立て、`read_paths`、`write_paths`、`output_schema_path` とともに `super().start(...)` に渡す。
+
+job 固有の任意補足入力（例: `extra_input`）は、ユーザーが明示した場合だけ per-run の `input` に追加する。呼び出し元の判断だけで補足入力を作って渡さない。
 
 標準構成:
 
@@ -118,16 +118,21 @@ validator の stdout / stderr は、`CodexValidationError` に保持される。
 - automatic review と review session の詳細契約は `review-spec.md` として扱う。
 - logging の詳細契約は `logging-spec.md` として扱う。
 - public wrapper API は job 用の `start`、`run`、`wait_any`、`done`、`result`、`cancel` と、review session 用の `start_review_session`、`ReviewSession.send`、`ReviewSession.close`、`ReviewSession.history` に留める。
-- model の初期 context に入れたい file または directory には `attachments` を使う。通常 file attachment は既定で上限付き inline し、directory は path だけ列挙する。
+- model の初期 context に入れたい text、file、directory、path-like 情報には `context` を使う。`attachments` と `instructions` は別々の public API 概念にせず、同じ初期 model context item として扱う。
+- `context` は固定または安定した item を先に、volatile または run-specific な item を後に並べる。OpenAI prompt caching は prefix-based automatic caching なので、wrapper は安定順序を作れるようにするだけで、item-level の cache flag や cache metadata は持たない。
+- per-run の可変要求や parameter は `input` に置く。prompt 構築時は安定した `context` を先に、`input` を後に置く。
 - `output_schema_path` は SDK turn の `output_schema` に渡すだけでなく、schema 本文を `Output schema` section として model の初期 context にも入れる。
-- `read_paths` は content injection ではなく filesystem permission として扱う。初期 context として内容を渡す file は `attachments` に入れる。
+- file 内容を同じ prompt に二重に入れない。file 内容を model に最初から見せる場合は `context` item として渡し、`input` 内に同じ内容を貼らない。path だけを使わせたい場合は `read_paths` / `write_paths` で filesystem permission を渡す。
+- `read_paths` は content injection ではなく filesystem permission として扱う。初期 context として内容を渡す file は `context` に入れる。
 - filesystem permission の意図には `read_paths` と `write_paths` を使う。`write_paths` は同じ path への read access も含む。
 - `read_paths` と `write_paths` は v1 では `cwd` 配下に限定され、Permission Profile の `:workspace_roots` rule として渡される。
 - thinking / reasoning effort を指定する場合は `reasoning_effort` を使い、wrapper は Codex CLI の `model_reasoning_effort` config として渡す。
 - `allow_shell_commands=True` では、検出できる場合だけ sandbox 内の command runner 用 Codex runtime directory を内部 read-only path として Permission Profile に追加する。
 - shell command 実行は既定で on とし、Permission Profile の filesystem sandbox 内で `read_paths` / `write_paths` の境界に従わせる。
-- shell command を使わせない job だけ `allow_shell_commands=False` を明示する。attachments の inline 挙動は shell command 設定に依存しない。
+- shell command を使わせない job だけ `allow_shell_commands=False` を明示する。context の inline 挙動は shell command 設定に依存しない。
 - command prefix ごとの allowlist / denylist は v1 API に入れず、必要なら呼び出し側が Codex CLI の rules 設定で管理する。
+- runner job と review session は、approval request、MCP servers、apps / MCP apps、multi-agent / collab、memory を常時 off にする。具体的な SDK API と config override は `sandbox-spec.md` を正本にする。
+- runner job は親 chat の hook、developer instruction、delegation policy、subagent 起動方針を継承しない独立した wrapper job として扱う。job に必要な固定契約は `context`、run-specific な要求は `input`、出力形式は schema で明示する。
 - `ignore_global_context=True` は best-effort な抑制としてだけ使う。`CODEX_HOME` は変更せず、global `AGENTS.md` の完全な隠蔽は保証しない。
 - automatic skill instructions を抑制する場合は `allowed_skills=[]` を使う。v1 は非空 `allowed_skills` による skill allow-list を扱わず、実行前に `ValueError` にする。
 

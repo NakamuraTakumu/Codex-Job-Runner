@@ -1,6 +1,6 @@
 # Jobs
 
-`jobs/` には、`codex_api_wrapper` で起動する再利用可能な wrapper job を置く。
+`jobs/` には、`codex_job_runner` で起動する再利用可能な wrapper job を置く。
 
 各 job は正式な agent や subagent ではなく、`CodexClient` subclass、prompt、schema をまとめた job template である。
 

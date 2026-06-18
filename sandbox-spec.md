@@ -26,7 +26,21 @@ Responsibility: `codex-job-runner` の filesystem sandbox、shell command、glob
 - `features.shell_tool=false`
 - `allow_login_shell=false`
 
-この設定は shell tool の利用を抑制するためのものであり、attachments の inline 挙動には影響しない。
+この設定は shell tool の利用を抑制するためのものであり、context の inline 挙動には影響しない。
+
+## Codex Runtime Features
+
+wrapper は runner job と review session の SDK thread を非対話実行として起動し、次を `ignore_global_context` に関係なく常時抑制する。
+
+| Feature | Mechanism |
+| --- | --- |
+| approval requests | SDK `thread_start(approval_mode=ApprovalMode.deny_all)` |
+| MCP servers | `mcp_servers={}` |
+| known apps / MCP apps | `features.apps=false`, `features.enable_mcp_apps=false` |
+| multi-agent / collab | `features.multi_agent=false`, `features.multi_agent_v2=false`, `features.collaboration_modes=false` |
+| memory | `features.memories=false`, `memories.generate_memories=false`, `memories.use_memories=false` |
+
+`connectors={}` は現 installed Codex CLI の strict config で unknown field になるため渡さない。wrapper が抑制するのは known apps / MCP apps と MCP server config の経路であり、将来の未知 connector 設定まで完全に無効化する保証ではない。
 
 ## SDK Sandbox Mode
 
@@ -52,6 +66,7 @@ SDK sandbox mode は大枠の実行 mode であり、path 単位の境界では�
 行うこと:
 
 - SDK config override で `project_doc_max_bytes=0` を渡す。
+- SDK config override で `features.hooks=false` を渡す。
 - `allowed_skills` が未指定なら `[]` として扱い、`skills.include_instructions=false` を渡す。
 - prompt 上で global `AGENTS.md` と skills に依存しないよう指示する。
 
@@ -71,7 +86,7 @@ SDK sandbox mode は大枠の実行 mode であり、path 単位の境界では�
 | `[]` | `skills.include_instructions=false` を渡す。 |
 | non-empty list | 未対応。実行前に `ValueError`。 |
 
-非空 list による skill allow-list は v1 public API に含めない。必要な skill 指示は `input`、`attachments`、または呼び出し側の prompt で明示する。
+非空 list による skill allow-list は v1 public API に含めない。必要な skill 指示は `input`、`context`、または呼び出し側の prompt で明示する。
 
 ## Failure
 

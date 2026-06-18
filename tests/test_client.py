@@ -16,8 +16,8 @@ from types import SimpleNamespace
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import codex_api_wrapper.client as client_module  # noqa: E402
-from codex_api_wrapper import (  # noqa: E402
+import codex_job_runner.client as client_module  # noqa: E402
+from codex_job_runner import (  # noqa: E402
     CodexCancelledError,
     CodexResponse,
     CodexClient,
@@ -27,6 +27,9 @@ from codex_api_wrapper import (  # noqa: E402
     ReviewConfig,
 )
 from jobs.demo_company_analysis import DemoCompanyAnalysisClient  # noqa: E402
+
+
+_FAKE_APPROVAL_MODE = SimpleNamespace(deny_all="deny_all", auto_review="auto_review")
 
 
 class CodexClientTests(unittest.TestCase):
@@ -49,12 +52,23 @@ class CodexClientTests(unittest.TestCase):
         client_module._import_openai_codex = self._previous_import
         self.tmp.cleanup()
 
+    def test_legacy_codex_api_wrapper_imports_alias_job_runner(self):
+        import codex_api_wrapper
+        import codex_api_wrapper.client as legacy_client_module
+
+        self.assertIs(codex_api_wrapper.CodexClient, CodexClient)
+        self.assertIs(legacy_client_module.CodexClient, CodexClient)
+        self.assertIs(
+            legacy_client_module._sdk_sandbox_for_permissions,
+            client_module._sdk_sandbox_for_permissions,
+        )
+
     def test_run_returns_response_content(self):
         client = CodexClient(cwd=str(self.project))
 
         response = client.run(
             input="README を要約して",
-            attachments=["README.md"],
+            context=["README.md"],
             read_paths=["README.md"],
             write_paths=["out"],
             timeout=3,
@@ -91,17 +105,17 @@ class CodexClientTests(unittest.TestCase):
         self.assertIn("[Main Attempt][Result]", output)
 
     def test_review_config_default_timeout_is_none(self):
-        review = ReviewConfig(instructions="x")
+        review = ReviewConfig(context="x")
         self.assertIsNone(review.timeout)
         self.assertIsNone(review.read_paths)
         self.assertFalse(review.reuse_session)
-        self.assertFalse(review.include_main_prompt)
+        self.assertFalse(review.include_main_context)
 
     def test_review_session_preserves_history_in_prompt(self):
         client = CodexClient(cwd=str(self.project))
 
         session = client.start_review_session(
-            review=ReviewConfig(instructions="Be precise."),
+            review=ReviewConfig(context="Be precise."),
             read_paths=["README.md"],
         )
         try:
@@ -156,10 +170,12 @@ class CodexClientTests(unittest.TestCase):
 
         class FakeCodex:
             def __init__(self, config=None):
+                captured["sdk_config"] = config
                 self.config = config
 
             def thread_start(self, **kwargs):
                 captured["thread_start_calls"] += 1
+                captured["thread_start_kwargs"] = kwargs
                 return FakeThread()
 
             def close(self):
@@ -169,6 +185,7 @@ class CodexClientTests(unittest.TestCase):
             Codex=FakeCodex,
             CodexConfig=lambda **kwargs: SimpleNamespace(**kwargs),
             Sandbox=SimpleNamespace(read_only="read_only", workspace_write="workspace_write"),
+            ApprovalMode=_FAKE_APPROVAL_MODE,
         )
 
         previous_import = client_module._import_openai_codex
@@ -176,7 +193,7 @@ class CodexClientTests(unittest.TestCase):
         try:
             client = CodexClient(cwd=str(self.project))
             session = client.start_review_session(
-                review=ReviewConfig(instructions="Use conversation history."),
+                review=ReviewConfig(context="Use conversation history."),
             )
             try:
                 first = session.send("first question")
@@ -189,6 +206,9 @@ class CodexClientTests(unittest.TestCase):
         self.assertEqual(first.content, "reply:first question")
         self.assertIn("Conversation history:", second.content)
         self.assertEqual(captured["thread_start_calls"], 1)
+        self.assertEqual(captured["thread_start_kwargs"]["approval_mode"], "deny_all")
+        for override in client_module._RUNNER_ALWAYS_OFF_CONFIG_OVERRIDES:
+            self.assertIn(override, captured["sdk_config"].config_overrides)
         self.assertEqual(captured["turn_prompts"][0], "first question")
         self.assertIn("Runner:\nfirst question", captured["turn_prompts"][1])
         self.assertTrue(captured.get("closed"))
@@ -285,6 +305,7 @@ class CodexClientTests(unittest.TestCase):
             Codex=FakeCodex,
             CodexConfig=lambda **kwargs: SimpleNamespace(**kwargs),
             Sandbox=SimpleNamespace(read_only="read_only", workspace_write="workspace_write"),
+            ApprovalMode=_FAKE_APPROVAL_MODE,
         )
 
         previous_import = client_module._import_openai_codex
@@ -321,12 +342,16 @@ class CodexClientTests(unittest.TestCase):
                 "output_usd_per_million": 4.5,
             },
         )
-        self.assertAlmostEqual(response.estimated_cost_usd, 0.0000264)
+        self.assertAlmostEqual(response.estimated_cost_usd, 0.0000249)
         self.assertEqual(captured["thread_start_kwargs"]["sandbox"], "workspace_write")
         self.assertTrue(captured["thread_start_kwargs"]["ephemeral"])
+        self.assertEqual(captured["thread_start_kwargs"]["approval_mode"], "deny_all")
         self.assertEqual(captured["turn_kwargs"]["sandbox"], "workspace_write")
         self.assertEqual(captured["turn_kwargs"]["output_schema"], {"type": "object"})
+        for override in client_module._RUNNER_ALWAYS_OFF_CONFIG_OVERRIDES:
+            self.assertIn(override, captured["sdk_config"].config_overrides)
         self.assertIn("project_doc_max_bytes=0", captured["sdk_config"].config_overrides)
+        self.assertIn("features.hooks=false", captured["sdk_config"].config_overrides)
         self.assertIn("skills.include_instructions=false", captured["sdk_config"].config_overrides)
         self.assertTrue(captured.get("closed"))
         stream_messages = [entry.message for entry in response.activity_log if entry.phase == "stream"]
@@ -394,6 +419,40 @@ class CodexClientTests(unittest.TestCase):
         output = captured.getvalue()
         self.assertIn("[Main Attempt][Usage]", output)
 
+    def test_estimate_cost_counts_cached_input_as_part_of_input_tokens(self):
+        estimated = client_module._estimate_cost_usd_for_usage(
+            usage={
+                "input_tokens": 11,
+                "cached_input_tokens": 2,
+                "output_tokens": 3,
+                "reasoning_output_tokens": 1,
+            },
+            pricing={
+                "input_usd_per_million": 0.75,
+                "cached_input_usd_per_million": 0.075,
+                "output_usd_per_million": 4.5,
+            },
+        )
+
+        self.assertAlmostEqual(estimated, 0.0000249)
+
+    def test_estimate_cost_clamps_non_cached_input_when_cached_exceeds_input(self):
+        estimated = client_module._estimate_cost_usd_for_usage(
+            usage={
+                "input_tokens": 10,
+                "cached_input_tokens": 12,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+            },
+            pricing={
+                "input_usd_per_million": 0.75,
+                "cached_input_usd_per_million": 0.075,
+                "output_usd_per_million": 4.5,
+            },
+        )
+
+        self.assertAlmostEqual(estimated, 0.0000009)
+
     def test_normalize_sdk_usage_supports_nested_thread_token_usage(self):
         breakdown = SimpleNamespace(
             input_tokens=11,
@@ -422,7 +481,7 @@ class CodexClientTests(unittest.TestCase):
 
         class FakeTurnResult:
             def __init__(self, prompt):
-                if "Internal review mode: codex_api_wrapper" in prompt:
+                if "Internal review mode: codex_job_runner" in prompt:
                     self.final_response = '{"passed": true, "repair_text": "", "summary": "ok"}'
                 else:
                     self.final_response = "sdk final answer"
@@ -458,6 +517,7 @@ class CodexClientTests(unittest.TestCase):
             Codex=FakeCodex,
             CodexConfig=lambda **kwargs: SimpleNamespace(**kwargs),
             Sandbox=SimpleNamespace(read_only="read_only", workspace_write="workspace_write"),
+            ApprovalMode=_FAKE_APPROVAL_MODE,
         )
 
         previous_import = client_module._import_openai_codex
@@ -466,7 +526,7 @@ class CodexClientTests(unittest.TestCase):
             client = CodexClient(cwd=str(self.project), ephemeral=True)
             response = client.run(
                 input="x",
-                review=ReviewConfig(instructions="REVIEW_SHOULD_PASS"),
+                review=ReviewConfig(context="REVIEW_SHOULD_PASS"),
                 timeout=3,
             )
         finally:
@@ -481,7 +541,7 @@ class CodexClientTests(unittest.TestCase):
 
         class FakeTurnResult:
             def __init__(self, prompt):
-                if "Internal review mode: codex_api_wrapper" in prompt:
+                if "Internal review mode: codex_job_runner" in prompt:
                     self.final_response = '{"passed": true, "repair_text": "", "summary": "ok"}'
                 else:
                     self.final_response = "sdk final answer"
@@ -517,6 +577,7 @@ class CodexClientTests(unittest.TestCase):
             Codex=FakeCodex,
             CodexConfig=lambda **kwargs: SimpleNamespace(**kwargs),
             Sandbox=SimpleNamespace(read_only="read_only", workspace_write="workspace_write"),
+            ApprovalMode=_FAKE_APPROVAL_MODE,
         )
 
         previous_import = client_module._import_openai_codex
@@ -525,7 +586,7 @@ class CodexClientTests(unittest.TestCase):
             client = CodexClient(cwd=str(self.project))
             response = client.run(
                 input="x",
-                review=ReviewConfig(instructions="REVIEW_SHOULD_PASS"),
+                review=ReviewConfig(context="REVIEW_SHOULD_PASS"),
                 timeout=3,
             )
         finally:
@@ -533,7 +594,7 @@ class CodexClientTests(unittest.TestCase):
 
         self.assertEqual(response.content, "sdk final answer")
         self.assertEqual(len(captured["prompts"]), 2)
-        self.assertTrue(any("Internal review mode: codex_api_wrapper" in prompt for prompt in captured["prompts"]))
+        self.assertTrue(any("Internal review mode: codex_job_runner" in prompt for prompt in captured["prompts"]))
 
     def test_review_stream_usage_is_logged_with_reviewer_actor(self):
         captured_stdout = io.StringIO()
@@ -614,6 +675,7 @@ class CodexClientTests(unittest.TestCase):
             Codex=FakeCodex,
             CodexConfig=lambda **kwargs: SimpleNamespace(**kwargs),
             Sandbox=SimpleNamespace(read_only="read_only", workspace_write="workspace_write"),
+            ApprovalMode=_FAKE_APPROVAL_MODE,
         )
 
         previous_import = client_module._import_openai_codex
@@ -623,7 +685,7 @@ class CodexClientTests(unittest.TestCase):
             with contextlib.redirect_stdout(captured_stdout):
                 response = client.run(
                     input="x",
-                    review=ReviewConfig(instructions="REVIEW_SHOULD_PASS"),
+                    review=ReviewConfig(context="REVIEW_SHOULD_PASS"),
                     timeout=3,
                 )
         finally:
@@ -657,7 +719,7 @@ class CodexClientTests(unittest.TestCase):
         self.assertTrue(job._repair_validation_failures)
         self.assertEqual(job._max_repairs, 5)
         self.assertIsNotNone(job._review_config)
-        self.assertIn("references in the JSON output", job._review_config.instructions)
+        self.assertIn("references in the JSON output", "\n\n".join(job._review_config.context))
         self.assertIsNone(job._review_config.timeout)
         self.assertIsNone(client.timeout)
         self.assertEqual(job._subcwd_files, ["${SUBCWD}/workflow_checklist.json"])
@@ -728,6 +790,55 @@ class CodexClientTests(unittest.TestCase):
             )
             self.assertIn("Failure stage:\nvalidator", prompt)
             self.assertIn("Incomplete checklist items:\nchecked_salary, checked_references", prompt)
+            self.assertNotIn("Original request:", prompt)
+            self.assertNotIn("Readable paths:", prompt)
+            self.assertNotIn("Writable paths:", prompt)
+            self.assertNotIn("Workspace files staged under ${SUBCWD}:", prompt)
+        finally:
+            job.cancel()
+
+    def test_repair_prompt_does_not_reinject_static_main_context(self):
+        schema = self.project / "schema.json"
+        schema.write_text('{"type":"object"}\n', encoding="utf-8")
+        context_file = self.project / "notes.txt"
+        context_file.write_text("context_file text\n", encoding="utf-8")
+        client = CodexClient(cwd=str(self.project), ignore_global_context=True)
+        job = client.start(
+            input="x",
+            context=["notes.txt"],
+            read_paths=["notes.txt"],
+            write_paths=["out"],
+            output_schema_path=str(schema),
+        )
+        try:
+            response = CodexResponse(
+                content='{"ok": false}',
+                returncode=0,
+                stdout="",
+                stderr="",
+                argv=(),
+                usage=None,
+                files={},
+                activity_log=(),
+            )
+            validation = SimpleNamespace(returncode=1, stdout="bad", stderr="wrong")
+            prompt = job._build_repair_prompt(
+                response=response,
+                validation=validation,
+                review=None,
+                attempt_index=1,
+                repair_index=1,
+            )
+
+            self.assertIn("The previous output failed validation or review.", prompt)
+            self.assertIn("Validator stdout:\nbad", prompt)
+            self.assertIn("Validator stderr:\nwrong", prompt)
+            self.assertNotIn("Global AGENTS.md", prompt)
+            self.assertNotIn("Output schema:", prompt)
+            self.assertNotIn("Context paths:", prompt)
+            self.assertNotIn("Context:", prompt)
+            self.assertNotIn("Readable paths:", prompt)
+            self.assertNotIn("Writable paths:", prompt)
         finally:
             job.cancel()
 
@@ -779,8 +890,85 @@ class CodexClientTests(unittest.TestCase):
         self.assertIn("source=validator", repair_prompt_entries[0].message)
         self.assertIn("sha256=", repair_prompt_entries[0].message)
         log_text = pathlib.Path(response.log_path).read_text(encoding="utf-8")
-        self.assertIn("[Repair][Prompt] attempt=1 repair=1", log_text)
+        self.assertIn("[Repair][Prompt]", log_text)
+        self.assertNotIn("[Repair][Prompt] attempt=1 repair=1", log_text)
         self.assertIn("[Main Attempt][Start] attempt=1 repair=1", log_text)
+
+    def test_main_repair_attempt_reuses_sdk_thread(self):
+        validator = self._make_validator(
+            "validate_json_only.py",
+            """
+            import json
+            import sys
+
+            json.loads(sys.stdin.read())
+            sys.exit(0)
+            """,
+        )
+        captured = {"thread_start_calls": 0, "turn_prompts": [], "closed": 0}
+
+        class FakeUsage:
+            input_tokens = 1
+            cached_input_tokens = 0
+            output_tokens = 1
+            reasoning_output_tokens = 0
+
+        class FakeTurnResult:
+            usage = FakeUsage()
+            items = []
+
+            def __init__(self, prompt):
+                if "The previous output failed validation or review." in prompt:
+                    self.final_response = '{"ok": true}'
+                else:
+                    self.final_response = "not json"
+
+        class FakeTurn:
+            def __init__(self, prompt):
+                self.prompt = prompt
+
+            def run(self):
+                return FakeTurnResult(self.prompt)
+
+        class FakeThread:
+            def turn(self, prompt, **kwargs):
+                captured["turn_prompts"].append(prompt)
+                return FakeTurn(prompt)
+
+        class FakeCodex:
+            def __init__(self, config=None):
+                self.config = config
+
+            def thread_start(self, **kwargs):
+                captured["thread_start_calls"] += 1
+                return FakeThread()
+
+            def close(self):
+                captured["closed"] += 1
+
+        fake_sdk = SimpleNamespace(
+            Codex=FakeCodex,
+            CodexConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+            Sandbox=SimpleNamespace(read_only="read_only", workspace_write="workspace_write"),
+            ApprovalMode=_FAKE_APPROVAL_MODE,
+        )
+        client_module._import_openai_codex = lambda: fake_sdk
+        client = CodexClient(cwd=str(self.project))
+
+        response = client.run(
+            input="NEEDS_REPAIR",
+            output_validator=["python3", str(validator)],
+            repair_validation_failures=True,
+            max_repairs=1,
+            timeout=3,
+        )
+
+        self.assertEqual(response.content, '{"ok": true}')
+        self.assertEqual(captured["thread_start_calls"], 1)
+        self.assertEqual(len(captured["turn_prompts"]), 2)
+        self.assertIn("NEEDS_REPAIR", captured["turn_prompts"][0])
+        self.assertIn("The previous output failed validation or review.", captured["turn_prompts"][1])
+        self.assertEqual(captured["closed"], 1)
 
     def test_review_after_validator_repair_does_not_receive_validator_stderr(self):
         validator = self._make_validator(
@@ -818,14 +1006,14 @@ class CodexClientTests(unittest.TestCase):
             output_validator=["python3", str(validator)],
             repair_validation_failures=True,
             max_repairs=1,
-            review=ReviewConfig(instructions="REVIEW_SHOULD_PASS"),
+            review=ReviewConfig(context="REVIEW_SHOULD_PASS"),
             timeout=3,
         )
 
         self.assertEqual(response.content, '{"ok": true}')
         self.assertNotIn("Validator stderr:", captured["message"])
         self.assertNotIn("JSONDecodeError", captured["message"])
-        self.assertNotIn("Main job prompt:", captured["message"])
+        self.assertNotIn("Main job context:", captured["message"])
 
     def test_argv_contains_sdk_context_controls_and_permissions(self):
         client = CodexClient(
@@ -851,6 +1039,9 @@ class CodexClientTests(unittest.TestCase):
         self.assertIn("--effort", argv)
         self.assertIn("medium", argv)
         self.assertIn("project_doc_max_bytes=0", argv)
+        self.assertIn("features.hooks=false", argv)
+        for override in client_module._RUNNER_ALWAYS_OFF_CONFIG_OVERRIDES:
+            self.assertIn(override, argv)
         self.assertIn("features.shell_tool=false", argv)
         self.assertIn("allow_login_shell=false", argv)
         self.assertIn("skills.include_instructions=false", argv)
@@ -957,51 +1148,73 @@ class CodexClientTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             client.start(input="x", read_paths=[str(outside)])
 
-    def test_file_attachments_are_inlined_by_default(self):
+    def test_file_context_are_inlined_by_default(self):
         client = CodexClient(cwd=str(self.project))
 
-        response = client.run(input="ECHO_PROMPT", attachments=["README.md"])
+        response = client.run(input="ECHO_PROMPT", context=["README.md"])
 
-        self.assertIn("Attachments:", response.content)
-        self.assertIn("Attached file contents:", response.content)
-        self.assertIn("<AttachedFile path=", response.content)
+        self.assertIn("Context paths:", response.content)
+        self.assertIn("Context:", response.content)
+        self.assertIn("<ContextFile path=", response.content)
         self.assertIn("hello\n", response.content)
 
-    def test_inline_attachments_none_uses_default_inline(self):
+    def test_inline_context_none_uses_default_inline(self):
         client = CodexClient(cwd=str(self.project))
 
         response = client.run(
             input="ECHO_PROMPT",
-            attachments=["README.md"],
-            inline_attachments=None,
+            context=["README.md"],
+            inline_context=None,
         )
 
-        self.assertIn("Attached file contents:", response.content)
+        self.assertIn("Context:", response.content)
         self.assertIn("hello\n", response.content)
 
-    def test_inline_attachments_false_lists_paths_without_contents(self):
+    def test_inline_context_false_lists_paths_without_contents(self):
         client = CodexClient(
                         cwd=str(self.project),
         )
 
         response = client.run(
             input="ECHO_PROMPT",
-            attachments=["README.md"],
-            inline_attachments=False,
+            context=["README.md"],
+            inline_context=False,
         )
 
-        self.assertIn("Attachments:", response.content)
-        self.assertNotIn("Attached file contents:", response.content)
-        self.assertNotIn("<AttachedFile path=", response.content)
+        self.assertIn("Context paths:", response.content)
+        self.assertNotIn("Context:", response.content)
+        self.assertNotIn("<ContextFile path=", response.content)
 
-    def test_inline_attachment_size_limit_errors(self):
+    def test_string_context_without_path_shape_is_inline_text(self):
+        client = CodexClient(cwd=str(self.project))
+
+        response = client.run(input="ECHO_PROMPT", context=["Use concise wording"])
+
+        self.assertIn("<ContextText>", response.content)
+        self.assertIn("Use concise wording", response.content)
+        self.assertNotIn("Context paths:", response.content)
+
+    def test_context_preserves_caller_order_before_input(self):
+        client = CodexClient(cwd=str(self.project))
+
+        response = client.run(
+            input="ECHO_PROMPT",
+            context=["first stable text", "README.md", "last volatile text"],
+        )
+
+        prompt = response.content
+        self.assertLess(prompt.index("first stable text"), prompt.index("<ContextFile path="))
+        self.assertLess(prompt.index("<ContextFile path="), prompt.index("last volatile text"))
+        self.assertLess(prompt.index("last volatile text"), prompt.index("ECHO_PROMPT"))
+
+    def test_inline_context_size_limit_errors(self):
         client = CodexClient(cwd=str(self.project))
 
         with self.assertRaises(ValueError):
             client.start(
                 input="x",
-                attachments=["README.md"],
-                max_inline_attachment_bytes=1,
+                context=["README.md"],
+                max_inline_context_bytes=1,
             )
 
     def test_allowed_skills_empty_disables_skill_instructions(self):
@@ -1151,7 +1364,7 @@ class CodexClientTests(unittest.TestCase):
             client.start(
                 input="x",
                 output_schema_path="result.schema.json",
-                max_inline_attachment_bytes=1,
+                max_inline_context_bytes=1,
             )
 
     def test_missing_output_schema_path_errors_before_start(self):
@@ -1230,18 +1443,31 @@ class CodexClientTests(unittest.TestCase):
 
         response = client.run(
             input="x",
-            review=ReviewConfig(instructions="REVIEW_SHOULD_PASS"),
+            review=ReviewConfig(context="REVIEW_SHOULD_PASS"),
             timeout=3,
         )
 
         self.assertEqual(response.content, "fake final answer")
+
+    def test_review_mode_notice_is_included_in_initial_main_context(self):
+        client = CodexClient(cwd=str(self.project))
+
+        response = client.run(
+            input="ECHO_PROMPT",
+            review=ReviewConfig(context="REVIEW_SHOULD_PASS"),
+            timeout=3,
+        )
+
+        self.assertIn("Review mode:", response.content)
+        self.assertIn("internal reviewer will check the final response", response.content)
+        self.assertIn("may be sent back for repair", response.content)
 
     def test_review_failure_triggers_repair_and_succeeds(self):
         client = CodexClient(cwd=str(self.project))
 
         response = client.run(
             input="REVIEW_TRIGGER_REPAIR",
-            review=ReviewConfig(instructions="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE"),
+            review=ReviewConfig(context="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE"),
             repair_validation_failures=True,
             max_repairs=1,
             timeout=3,
@@ -1271,7 +1497,7 @@ class CodexClientTests(unittest.TestCase):
         with self.assertRaises(CodexValidationError) as caught:
             client.run(
                 input="REVIEW_TRIGGER_REPAIR",
-                review=ReviewConfig(instructions="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE"),
+                review=ReviewConfig(context="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE"),
                 timeout=3,
             )
 
@@ -1291,7 +1517,7 @@ class CodexClientTests(unittest.TestCase):
         with self.assertRaises(CodexValidationError) as caught:
             client.run(
                 input="REVIEW_TRIGGER_REPAIR",
-                review=ReviewConfig(instructions="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE"),
+                review=ReviewConfig(context="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE"),
                 repair_validation_failures=True,
                 max_repairs=0,
                 timeout=3,
@@ -1343,7 +1569,7 @@ class CodexClientTests(unittest.TestCase):
         response = client.run(
             input="REVIEW_TRIGGER_REPAIR",
             review=ReviewConfig(
-                instructions="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE",
+                context="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE",
                 reuse_session=True,
             ),
             repair_validation_failures=True,
@@ -1361,7 +1587,7 @@ class CodexClientTests(unittest.TestCase):
 
         response = client.run(
             input="企業について短い構造化分析を行い、JSON だけを返してください。\n\nCompany name:\n日本アイ・ビー・エム株式会社",
-            review=ReviewConfig(instructions="REVIEW_SHOULD_PASS"),
+            review=ReviewConfig(context="REVIEW_SHOULD_PASS"),
             timeout=3,
         )
 
@@ -1451,7 +1677,7 @@ class CodexClientTests(unittest.TestCase):
         class FakeThread:
             def turn(self, prompt, **kwargs):
                 captured["turn_prompts"].append(prompt)
-                if "Internal review mode: codex_api_wrapper" in prompt:
+                if "Internal review mode: codex_job_runner" in prompt:
                     return FakeReviewTurn(prompt)
                 return FakeMainTurn(prompt)
 
@@ -1471,6 +1697,7 @@ class CodexClientTests(unittest.TestCase):
             Codex=FakeCodex,
             CodexConfig=lambda **kwargs: SimpleNamespace(**kwargs),
             Sandbox=SimpleNamespace(read_only="read_only", workspace_write="workspace_write"),
+            ApprovalMode=_FAKE_APPROVAL_MODE,
         )
 
         previous_import = client_module._import_openai_codex
@@ -1481,7 +1708,7 @@ class CodexClientTests(unittest.TestCase):
             with contextlib.redirect_stdout(captured_stdout):
                 response = client.run(
                     input="REVIEW_STREAM_LOGGING",
-                    review=ReviewConfig(instructions="REVIEW_STREAM_LOGGING"),
+                    review=ReviewConfig(context="REVIEW_STREAM_LOGGING"),
                     timeout=3,
                 )
         finally:
@@ -1498,7 +1725,8 @@ class CodexClientTests(unittest.TestCase):
             )
         )
         printed = captured_stdout.getvalue()
-        self.assertIn("[Reviewer][Thinking] attempt=0 repair=0", printed)
+        self.assertIn("[Reviewer][Thinking]", printed)
+        self.assertNotIn("[Reviewer][Thinking] attempt=0 repair=0", printed)
         self.assertIn("[Reviewer][Search]", printed)
         self.assertIn("[Reviewer][Message]", printed)
 
@@ -1518,35 +1746,35 @@ class CodexClientTests(unittest.TestCase):
             client.run(
                 input="x",
                 output_validator=["python3", str(validator)],
-                review=ReviewConfig(instructions="REVIEW_FORCE_BAD_OUTPUT"),
+                review=ReviewConfig(context="REVIEW_FORCE_BAD_OUTPUT"),
                 timeout=3,
             )
 
         self.assertEqual(caught.exception.failure_stage, "validator")
         self.assertEqual(caught.exception.validator_returncode, 5)
 
-    def test_review_can_see_original_input_prompt_without_main_prompt_by_default(self):
+    def test_review_can_see_original_input_without_main_context_by_default(self):
         client = CodexClient(cwd=str(self.project))
 
         response = client.run(
             input="REVIEW_CONTEXT_MARKER",
             subcwd_files={"state.json": {"text": '{"ok": true}\n'}},
             read_paths=["${SUBCWD}/state.json"],
-            review=ReviewConfig(instructions="CHECK_REVIEW_CONTEXT"),
+            review=ReviewConfig(context="CHECK_REVIEW_CONTEXT"),
             collect_files=True,
             timeout=3,
         )
 
         self.assertEqual(response.content, "fake final answer")
 
-    def test_review_can_opt_in_to_main_prompt_context(self):
+    def test_review_can_opt_in_to_main_context(self):
         client = CodexClient(cwd=str(self.project))
 
         response = client.run(
-            input="REVIEW_CONTEXT_MARKER REQUIRE_MAIN_PROMPT",
+            input="REVIEW_CONTEXT_MARKER REQUIRE_MAIN_CONTEXT",
             review=ReviewConfig(
-                instructions="CHECK_REVIEW_CONTEXT",
-                include_main_prompt=True,
+                context="CHECK_REVIEW_CONTEXT",
+                include_main_context=True,
             ),
             timeout=3,
         )
@@ -1583,7 +1811,7 @@ class CodexClientTests(unittest.TestCase):
             input="REVIEW_CONTEXT_MARKER",
             read_paths=["README.md", "${SUBCWD}/state.json"],
             subcwd_files={"state.json": {"text": '{"ok": true}\n'}},
-            review=ReviewConfig(instructions="CHECK_REVIEW_CONTEXT"),
+            review=ReviewConfig(context="CHECK_REVIEW_CONTEXT"),
             collect_files=True,
             timeout=3,
         )
@@ -1593,7 +1821,7 @@ class CodexClientTests(unittest.TestCase):
         self.assertEqual(captured["read_paths"][1].name, "state.json")
         self.assertIn("Subcwd path:", captured["message"])
         self.assertIn("Review readable paths:", captured["message"])
-        self.assertNotIn("Main job prompt:", captured["message"])
+        self.assertNotIn("Main job context:", captured["message"])
         review_detail_entries = [
             entry for entry in response.activity_log
             if entry.phase == "review" and entry.event == "detail"
@@ -1647,7 +1875,7 @@ class CodexClientTests(unittest.TestCase):
             read_paths=["README.md", "${SUBCWD}/state.json"],
             subcwd_files={"state.json": {"text": '{"ok": true}\n'}},
             review=ReviewConfig(
-                instructions="CHECK_REVIEW_CONTEXT",
+                context="CHECK_REVIEW_CONTEXT",
                 read_paths=["${SUBCWD}/state.json"],
             ),
             collect_files=True,
@@ -1679,7 +1907,7 @@ class CodexClientTests(unittest.TestCase):
             client.run(
                 input="x",
                 review=ReviewConfig(
-                    instructions="FORCE_REVIEW_TIMEOUT",
+                    context="FORCE_REVIEW_TIMEOUT",
                     timeout=0.1,
                 ),
                 timeout=3,
@@ -1693,7 +1921,7 @@ class CodexClientTests(unittest.TestCase):
         with self.assertRaises(CodexExecutionError) as caught:
             client.run(
                 input="x",
-                review=ReviewConfig(instructions="REVIEW_FORCE_BAD_OUTPUT"),
+                review=ReviewConfig(context="REVIEW_FORCE_BAD_OUTPUT"),
                 timeout=3,
             )
 
@@ -2105,11 +2333,11 @@ class CodexClientTests(unittest.TestCase):
         self.assertIs(done, fast)
         slow.cancel()
 
-    def test_missing_attachment_errors_before_start(self):
+    def test_missing_context_errors_before_start(self):
         client = CodexClient(cwd=str(self.project))
 
         with self.assertRaises(FileNotFoundError):
-            client.start(input="x", attachments=["missing.txt"])
+            client.start(input="x", context=["missing.txt"])
 
     def _subcwd_dirs(self):
         return [
@@ -2135,27 +2363,32 @@ class CodexClientTests(unittest.TestCase):
                 self.items = []
 
         class FakeTurn:
-            def __init__(self, prompt):
+            def __init__(self, prompt, context_prompt=None):
                 self.prompt = prompt
+                self.context_prompt = prompt if context_prompt is None else context_prompt
                 self._interrupted = False
 
             def run(self):
-                test_case._apply_fake_side_effects(self.prompt)
-                if "sleep" in self.prompt or "FORCE_REVIEW_TIMEOUT" in self.prompt:
+                test_case._apply_fake_side_effects(self.context_prompt)
+                if "sleep" in self.context_prompt or "FORCE_REVIEW_TIMEOUT" in self.context_prompt:
                     for _ in range(100):
                         if self._interrupted:
-                            return FakeTurnResult(self.prompt)
+                            return FakeTurnResult(self.context_prompt)
                         time.sleep(0.1)
-                if "FORCE_FAIL" in self.prompt:
+                if "FORCE_FAIL" in self.context_prompt:
                     raise RuntimeError("FAKE_STDERR")
-                return FakeTurnResult(self.prompt)
+                return FakeTurnResult(self.context_prompt)
 
             def interrupt(self):
                 self._interrupted = True
 
         class FakeThread:
+            def __init__(self):
+                self.prompts = []
+
             def turn(self, prompt, **kwargs):
-                return FakeTurn(prompt)
+                self.prompts.append(prompt)
+                return FakeTurn(prompt, "\n\n".join(self.prompts))
 
         class FakeCodex:
             def __init__(self, config=None):
@@ -2171,6 +2404,7 @@ class CodexClientTests(unittest.TestCase):
             Codex=FakeCodex,
             CodexConfig=lambda **kwargs: SimpleNamespace(**kwargs),
             Sandbox=SimpleNamespace(read_only="read_only", workspace_write="workspace_write"),
+            ApprovalMode=_FAKE_APPROVAL_MODE,
         )
         client_module._import_openai_codex = lambda: fake_sdk
 
@@ -2191,7 +2425,7 @@ class CodexClientTests(unittest.TestCase):
         if marker not in prompt:
             return prompt
         response = prompt.split(marker, 1)[1]
-        for terminator in ("\n\nSubcwd path:\n", "\n\nReview instructions:\n"):
+        for terminator in ("\n\nSubcwd path:\n", "\n\nReview context:\n"):
             if terminator in response:
                 response = response.split(terminator, 1)[0]
         return response
@@ -2251,14 +2485,14 @@ class CodexClientTests(unittest.TestCase):
                 final_answer = "needs review fix"
         if "ECHO_PROMPT" in prompt:
             final_answer = prompt
-        if "Internal review mode: codex_api_wrapper" in prompt:
+        if "Internal review mode: codex_job_runner" in prompt:
             if "REVIEW_FORCE_BAD_OUTPUT" in prompt:
                 final_answer = "not json"
             elif "CHECK_REVIEW_CONTEXT" in prompt:
                 if "Original request:\nREVIEW_CONTEXT_MARKER" not in prompt:
                     final_answer = '{"passed": false, "repair_text": "missing original input", "summary": "missing original input"}'
-                elif "REQUIRE_MAIN_PROMPT" in prompt and "Main job prompt:" not in prompt:
-                    final_answer = '{"passed": false, "repair_text": "missing main prompt", "summary": "missing main prompt"}'
+                elif "REQUIRE_MAIN_CONTEXT" in prompt and "Main job context:" not in prompt:
+                    final_answer = '{"passed": false, "repair_text": "missing main context", "summary": "missing main context"}'
                 else:
                     final_answer = '{"passed": true, "repair_text": "", "summary": "ok"}'
             elif "REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE" in prompt:

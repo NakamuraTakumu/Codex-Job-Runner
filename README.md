@@ -1,28 +1,26 @@
-# Codex API Wrapper
+# Codex Job Runner
 
-`codex_api_wrapper` は、`openai-codex` SDK を使って Codex job を扱う小さな pure Python wrapper である。
+`codex_job_runner` は、`openai-codex` SDK を使って Codex job を扱う小さな pure Python wrapper である。
 Python から Codex job を起動する必要がある skill、workflow、hook、script 作成者向けの補助 library として使う。OpenAI SDK 互換ではなく、最小の job-style API を提供する。
 
 この directory は Codex skill でもある。`SKILL.md` を entrypoint、この README を実用例、`spec.md` を利用者向け正本として扱う。機能別の詳細契約は `spec.md` 末尾の Feature Specs を参照する。
 
 ```python
-from codex_api_wrapper import CodexClient, ReviewConfig
+from codex_job_runner import CodexClient, ReviewConfig
 
 client = CodexClient(
     cwd="/home/nakamura/recruit",
     subcwd_root="tmp/codex-jobs",
-    timeout=300,
-    ignore_global_context=True,
 )
 
 job = client.start(
     input="このコードを説明して",
-    attachments=["src/main.py", "README.md"],
+    context=["src/main.py", "README.md"],
     read_paths=["src", "README.md"],
     write_paths=["tmp/codex-output"],
 )
 
-response = job.result(timeout=300)
+response = job.result()
 print(response.content)
 print(response.usage)
 print(response.argv)
@@ -45,12 +43,12 @@ for entry in response.activity_log:
 ## Review Session
 
 ```python
-from codex_api_wrapper import CodexClient, ReviewConfig
+from codex_job_runner import CodexClient, ReviewConfig
 
 client = CodexClient(cwd="/home/nakamura/recruit")
 session = client.start_review_session(
     review=ReviewConfig(
-        instructions="コードレビュー担当として、指摘と補足説明を返してください。",
+        context=["コードレビュー担当として、指摘と補足説明を返してください。"],
     ),
     read_paths=["src", "README.md"],
 )
@@ -67,12 +65,12 @@ print(second.content)
 
 `ReviewSession` は reviewer の会話履歴を保持し、同じ thread を継続利用する。
 
-自動 review 用には `ReviewConfig(read_paths=[...])` を指定できる。未指定時は主 job の `read_paths` を流用し、指定時はその list を review job 専用の read permission として使う。自動 review は既定で review attempt ごとに新しい session を使う。`ReviewConfig(reuse_session=True)` の場合だけ、review fail による main repair 後の再 review で同じ reviewer session を継続利用する。reviewer input は既定で main job prompt 全文を含めない。必要な job だけ `ReviewConfig(include_main_prompt=True)` を指定する。
+自動 review 用には `ReviewConfig(read_paths=[...])` を指定できる。未指定時は主 job の `read_paths` を流用し、指定時はその list を review job 専用の read permission として使う。自動 review は既定で review attempt ごとに新しい session を使う。`ReviewConfig(reuse_session=True)` の場合だけ、review fail による main repair 後の再 review で同じ reviewer session を継続利用する。reviewer input は既定で main job の初期 context 全文を含めない。必要な job だけ `ReviewConfig(include_main_context=True)` を指定する。
 
 ## 入力
 
-- `input`: 必須の task text。
-- `attachments`: prompt で重要 context として明示する path。
+- `context`: 初期 model context として渡す text、file、directory、path-like item。
+- `input`: 必須の run-specific task text または parameter。
 - `read_paths`: Codex が読んでよい path。
 - `write_paths`: Codex が書いてよい path。
 - `subcwd_files`: `${SUBCWD}` に事前配置する file 実体。
@@ -81,11 +79,17 @@ print(second.content)
 - `output_validator`: 最終応答を検証する command。
 - `collect_files`: `${SUBCWD}` 配下の通常 file を `response.files` へ回収する。
 
-`attachments` は model の初期 context に入れる file または directory path である。通常 file は既定で上限付き inline され、path と本文が prompt に入る。
+`context` は、model の初期 context に入れる text、file、directory、path-like item である。固定指示、job prompt material、参照 file は別々の public API 概念にせず、同じ `context` item として扱う。通常 file は既定で上限付き inline され、path と本文が prompt に入る。
 
-directory attachment は本文 inline されず、path だけ列挙される。通常 file の本文を入れたくない場合だけ `inline_attachments=False` を明示する。
+string context item は、`cwd` から解決した path が存在する場合は file または directory context になる。`PathLike` item と path らしい string が存在しない場合は error になり、それ以外の string は inline text context になる。`inline_context=False` は file 本文 inline だけを抑制し、inline text context は残す。
 
-`read_paths` は、attachments 以外に Codex が必要時に読んでよい filesystem 範囲である。attachments に入れた file だけを読ませる場合、通常は `read_paths` を別途広げる必要はない。
+directory context は本文 inline されず、path だけ列挙される。通常 file の本文を入れたくない場合だけ `inline_context=False` を明示する。
+
+`context` ordering matters。OpenAI prompt caching は prefix-based automatic caching なので、wrapper は固定または安定した共通 item を先に、volatile または run-specific な item を後に並べられるようにする。item-level の cache flag や cache metadata は持たない。
+
+`input` は run-specific な依頼や parameter であり、prompt 構築時は安定した `context` の後に置かれる。file 内容を `context` に入れる場合、同じ内容を `input` にも貼らない。
+
+`read_paths` は、context 以外に Codex が必要時に読んでよい filesystem 範囲である。context に入れた file だけを読ませる場合、通常は `read_paths` を別途広げる必要はない。
 
 `write_paths` または `read_paths` に `"${SUBCWD}/..."` を指定するか、`subcwd_files` を使うと、job ごとの一時 directory が `subcwd_root` 配下に作られる。`subcwd_root` を省略した場合は `cwd` を使う。`collect_files=True` の場合、job 終了後に通常 file を memory 上へ回収してから一時 directory を削除する。
 
@@ -134,8 +138,19 @@ print(response.files["report.md"].text)
 `ignore_global_context=True` は次を追加する。
 
 - `-c 'project_doc_max_bytes=0'`
+- `-c 'features.hooks=false'`
 - `allowed_skills` が未指定の場合は `-c 'skills.include_instructions=false'`
 - prompt 上で global `AGENTS.md` と skills に依存しないよう指示する文面
+
+runner は `ignore_global_context` に関係なく、非対話 job として次を常時 off にする。
+
+- approval requests: SDK `ApprovalMode.deny_all`
+- MCP servers: `-c 'mcp_servers={}'`
+- known apps / MCP apps: `-c 'features.apps=false'`, `-c 'features.enable_mcp_apps=false'`
+- multi-agent / collab: `-c 'features.multi_agent=false'`, `-c 'features.multi_agent_v2=false'`, `-c 'features.collaboration_modes=false'`
+- memory: `-c 'features.memories=false'`, `-c 'memories.generate_memories=false'`, `-c 'memories.use_memories=false'`
+
+`connectors={}` は現 installed Codex CLI の strict config で unknown field になるため渡さない。wrapper が抑制するのは known apps / MCP apps と MCP server config の経路であり、将来の未知 connector 設定まで完全に無効化する保証ではない。
 
 `CODEX_HOME` は変更しない。global `AGENTS.md` が隠れることも保証しない。
 
@@ -153,11 +168,11 @@ wrapper の既定値は `model="gpt-5.4-mini"` と `reasoning_effort="medium"` �
 
 command prefix ごとの allowlist / denylist は v1 API では扱わない。必要な場合は、Codex CLI の rules 設定を wrapper の外側で管理する。
 
-`read_paths` は filesystem permission であり、file 内容を prompt に入れる機能ではない。初期 context として内容を渡す場合は `attachments` を使う。
+`read_paths` は filesystem permission であり、file 内容を prompt に入れる機能ではない。初期 context として内容を渡す場合は `context` を使う。
 
 `subcwd_files` は `${SUBCWD}` workspace に初期 file を staged する per-call API である。key は `${SUBCWD}` 内の相対 path、value は `{"text": "..."}` または `{"bytes": b"..."}` とする。小さい UTF-8 text でも wrapper は自動 inline せず、prompt には staged file の path 一覧だけを出す。staged file を使う path は `read_paths` または `write_paths` で別途明示する。
 
-`output_schema_path` は SDK turn の `output_schema` に渡す。さらに schema file の本文を `Output schema` section として初期 context に入れる。schema は UTF-8 text の通常 file とし、inline attachment と同じ 1 file byte 上限に従う。wrapper は schema validation を自前実装しない。
+`output_schema_path` は SDK turn の `output_schema` に渡す。さらに schema file の本文を `Output schema` section として初期 context に入れる。schema は UTF-8 text の通常 file とし、inline context と同じ 1 file byte 上限に従う。wrapper は schema validation を自前実装しない。
 
 `output_pydantic_model` を指定した場合、wrapper は `model_json_schema()` から一時 JSON Schema file を生成して SDK turn に渡す。prompt context には model source context を入れる。さらに final response に対して `model_validate_json()` を走らせ、失敗した場合は `output_validator` より前に validation failure として扱う。`output_schema_path` と `output_pydantic_model` の同時指定はできない。
 
@@ -171,12 +186,12 @@ response = client.run(
     repair_validation_failures=True,
     max_repairs=5,
     review=ReviewConfig(
-        instructions="元の依頼と最終成果物が一致しているか確認し、問題があれば修正指示を返してください。",
+        context=["元の依頼と最終成果物が一致しているか確認し、問題があれば修正指示を返してください。"],
     ),
 )
 ```
 
-validator が non-zero で終了した場合は `CodexValidationError` になる。`repair_validation_failures=True` の場合、wrapper は同じ model と同じ `${SUBCWD}` で repair attempt を行い、成功した最終応答だけを返す。さらに `review=ReviewConfig(...)` を渡すと、validator 成功後に review session を 1 turn 実行する。reviewer の file access は `ReviewConfig.read_paths` があればそれを使い、なければ主 job の `read_paths` を流用する。review fail 時も repair prompt に修正指示を流し込む。`ReviewConfig(reuse_session=True)` の場合、review fail 後の再 review は同じ reviewer session に続けて送る。`ReviewConfig(include_main_prompt=True)` の場合だけ、reviewer input に main job prompt 全文を含める。詳細契約は `validation-repair-spec.md` を参照する。
+validator が non-zero で終了した場合は `CodexValidationError` になる。`repair_validation_failures=True` の場合、wrapper は同じ main SDK thread、同じ model、同じ `${SUBCWD}` で repair attempt を行い、成功した最終応答だけを返す。さらに `review=ReviewConfig(...)` を渡すと、初回 main context に review notice を追加し、validator 成功後に review session を 1 turn 実行する。review notice は repair turn には追加しない。reviewer の file access は `ReviewConfig.read_paths` があればそれを使い、なければ主 job の `read_paths` を流用する。review fail 時も repair request に修正指示を流し込む。`ReviewConfig(reuse_session=True)` の場合、review fail 後の再 review は同じ reviewer session に続けて送る。`ReviewConfig(include_main_context=True)` の場合だけ、reviewer input に main job context 全文を含める。詳細契約は `validation-repair-spec.md` と `review-spec.md` を参照する。
 
 `CodexResponse.usage` は `dict[str, int] | None` で、SDK が返した `turn.completed.usage` を保持する。repair が発生した job では attempt ごとに合算した値を返す。
 
@@ -205,7 +220,7 @@ wrapper は `-c` override で job ごとの Permission Profile を組み立て�
 
 `subcwd_files` がある job でも、wrapper は `${SUBCWD}` 権限を自動付与しない。staged file や生成 file は、必ず `${SUBCWD}/...` の read/write path で個別または directory 単位に明示する。実運用では `ignore_global_context=True` を推奨し、広い `read_paths` / `write_paths` は避ける。最も安全なのは job 専用 `cwd` を使う構成である。
 
-`allow_shell_commands=True` の場合、wrapper は sandbox 内の command runner が起動できるように、検出できた Codex runtime directory を内部 read-only path として Permission Profile に追加する。検出できない環境では追加しない。これは `attachments` やユーザー指定の `read_paths` とは別扱いであり、作業対象 data の読み取り許可を広げるものではない。
+`allow_shell_commands=True` の場合、wrapper は sandbox 内の command runner が起動できるように、検出できた Codex runtime directory を内部 read-only path として Permission Profile に追加する。検出できない環境では追加しない。これは `context` やユーザー指定の `read_paths` とは別扱いであり、作業対象 data の読み取り許可を広げるものではない。
 
 v1 の `read_paths` / `write_paths` は `cwd` 配下だけを受け取る。wrapper は path を `cwd` からの相対 path に変換し、Permission Profile の `:workspace_roots` に渡す。`cwd` の外側の path は実行前に `ValueError` になる。
 

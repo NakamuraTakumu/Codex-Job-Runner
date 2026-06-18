@@ -13,6 +13,8 @@ Responsibility: `codex-job-runner` の activity log、file log、stdout progress
 
 **stdout progress output**: wrapper は activity が発生するたびに `[Phase][Event] ...` 形式の進捗行を process stdout に出す。v1 ではこの stdout progress output を止める public option はない。
 
+stdout progress output では、`attempt=...` と `repair=...` は attempt / turn の start と end 相当の行だけに出す。usage、stream item、validator detail、review detail、repair prompt 要約などの途中行には出さない。
+
 ## Log Destination
 
 `CodexClient(log_dir=...)` は job log の既定 directory を指定する。未指定時は resolved `cwd/.codex-job-runner-logs` を使う。

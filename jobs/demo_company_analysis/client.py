@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from codex_api_wrapper import CodexClient, ReviewConfig
+from codex_job_runner import CodexClient, ReviewConfig
 
 
 HERE = Path(__file__).resolve().parent
@@ -35,7 +35,7 @@ class DemoCompanyAnalysisClient(CodexClient):
         self,
         *,
         company_name,
-        attachments=None,
+        context=None,
         read_paths=None,
         write_paths=None,
         extra_input=None,
@@ -44,17 +44,18 @@ class DemoCompanyAnalysisClient(CodexClient):
     ):
         prompt = _build_input(company_name=company_name, extra_input=extra_input)
         resolved_review = review or ReviewConfig(
-            instructions=_DEFAULT_REVIEW_INSTRUCTIONS,
+            context=[_DEFAULT_REVIEW_INSTRUCTIONS],
         )
-        attachment_list = list(attachments or [])
-        readable = list(read_paths or attachment_list)
+        context_list = [PROMPT_PATH]
+        context_list.extend(list(context or []))
+        readable = list(read_paths or [])
         writable = list(write_paths or [])
         checklist_write_path = f"${{SUBCWD}}/{CHECKLIST_PATH}"
         if checklist_write_path not in writable:
             writable.append(checklist_write_path)
         return super().start(
             input=prompt,
-            attachments=attachment_list,
+            context=context_list,
             read_paths=readable,
             write_paths=writable,
             subcwd_files=_build_checklist_subcwd_files(),
@@ -68,19 +69,21 @@ class DemoCompanyAnalysisClient(CodexClient):
 
 
 def _build_input(*, company_name, extra_input):
-    prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
     sections = [
-        prompt,
         f"Company name:\n{company_name}",
-        (
-            "Workflow checklist:\n"
-            f"- Update `${{SUBCWD}}/{CHECKLIST_PATH}` as you complete each required step.\n"
-            "- Before finishing, every checklist item must be set to true."
-        ),
+        _checklist_context(),
     ]
     if extra_input:
         sections.append(f"Additional input:\n{extra_input}")
     return "\n\n".join(sections)
+
+
+def _checklist_context():
+    return (
+        "Workflow checklist:\n"
+        f"- Update `${{SUBCWD}}/{CHECKLIST_PATH}` as you complete each required step.\n"
+        "- Before finishing, every checklist item must be set to true."
+    )
 
 
 def _build_checklist_subcwd_files():

@@ -29,6 +29,6 @@ custom validation が必要な場合は `output_validator` を使う。validator
 
 ## Limits
 
-schema file は UTF-8 text の通常 file とする。inline する schema 本文は attachment inline byte limit に従う。
+schema file は UTF-8 text の通常 file とする。inline する schema 本文は inline context byte limit に従う。
 
 Pydantic から生成した一時 schema file は job cleanup 時に削除する。

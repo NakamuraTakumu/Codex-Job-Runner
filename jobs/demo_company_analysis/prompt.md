@@ -16,5 +16,5 @@
 - 最終応答は `output.schema.json` に従う JSON だけにする
 
 制約:
-- 明示された attachment と read path がある場合はそれも根拠として使ってよい
+- 明示された context と read path がある場合はそれも根拠として使ってよい
 - 十分な根拠がない断定は避ける

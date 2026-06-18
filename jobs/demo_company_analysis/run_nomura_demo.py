@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from jobs.demo_company_analysis import DemoCompanyAnalysisClient
-from codex_api_wrapper import CodexExecutionError, CodexValidationError
+from codex_job_runner import CodexExecutionError, CodexValidationError
 
 
 WORKDIR = HERE / "_demo_workspace"

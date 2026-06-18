@@ -30,12 +30,12 @@ response = client.run(
 print(response.content)
 ```
 
-補助資料を渡す場合は `attachments` と `read_paths` に追加する。
+補助資料の本文を最初から見せる場合は `context` に追加する。path 経由で必要時に読めればよい資料は `read_paths` に追加する。
 
 ```python
 response = client.run(
     company_name="OpenAI",
-    attachments=["notes/openai.md"],
+    context=["notes/openai.md"],
     read_paths=["notes/openai.md"],
 )
 ```

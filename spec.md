@@ -11,20 +11,20 @@ Responsibility: Python から Codex job を起動する利用者に対して、�
 
 利用者が最初に見るべき契約は次の 3 つだけである。
 
-1. **入力**: `input` に依頼文を渡し、`attachments` で初期 context、`read_paths` / `write_paths` で filesystem 権限を渡す。
+1. **入力**: `context` で初期 model context、`input` で run-specific な依頼や parameter、`read_paths` / `write_paths` で filesystem 権限を渡す。
 2. **出力**: 成功時は `CodexResponse.content` を主出力として読む。必要なら usage、cost 概算、回収 file、activity log を読む。
 3. **sandbox**: job が読める path と書ける path は Permission Profile で制限する。`danger-full-access` は public API に出さない。
 
 ## Minimal Use
 
 ```python
-from codex_api_wrapper import CodexClient
+from codex_job_runner import CodexClient
 
 client = CodexClient(cwd="/path/to/project")
 
 response = client.run(
     input="README を要約してください",
-    attachments=["README.md"],
+    context=["README.md"],
 )
 
 print(response.content)
@@ -36,21 +36,27 @@ print(response.content)
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `input` | yes | Codex への依頼文。空文字列は `ValueError`。 |
+| `input` | yes | run-specific な依頼文または parameter。空文字列は `ValueError`。 |
 
 `messages=[...]` は受け取らない。OpenAI Chat Completions 互換 API ではない。
+
+`input` は固定指示や file 本文を置く場所ではない。prompt 構築時は安定した `context` を先に置き、per-run に変わる `input` を後に置く。
 
 ### Context Input
 
 | Field | Meaning |
 | --- | --- |
-| `attachments` | model の初期 context に入れる file または directory。通常 file は既定で本文を inline する。 |
+| `context` | model の初期 context に入れる text、file、directory、path-like item。通常 file は既定で本文を inline し、directory は path だけ列挙する。 |
 | `read_paths` | job が追加で読んでよい file または directory。content injection ではない。 |
 | `write_paths` | job が書いてよい file または directory。同じ path の read 権限も含む。 |
 | `subcwd_files` | `${SUBCWD}` に事前配置する file。権限は自動付与しない。詳細は `subcwd-spec.md`。 |
-| `inline_attachments` | attachments の本文 inline を行うか。 |
+| `inline_context` | context 内の file 本文 inline を行うか。 |
 
-`attachments` と `read_paths` は役割が違う。model に最初から見せたい file は `attachments`、必要になったときだけ読めればよい範囲は `read_paths` に入れる。
+`context` は、従来別概念になりがちな attachment、instruction、job prompt material を同じ初期 model context item として扱う public API である。固定または安定した共通 item を先に、volatile または run-specific な item を後に並べる。OpenAI prompt caching は prefix-based automatic caching なので、wrapper は安定順序を作れるようにするだけで、item-level の cache flag や cache metadata は持たない。
+
+string context item は次の規則で解釈する。`cwd` から解決した path が存在する場合は file または directory context として扱う。`PathLike` item と、path 区切り・絶対 path・拡張子などにより path らしい string が存在しない場合は error にする。それ以外の string は inline text context として扱う。`inline_context=False` は file 本文 inline だけを抑制し、inline text context は残す。
+
+`context` と `read_paths` は役割が違う。model に最初から見せたい file は `context`、必要になったときだけ path 経由で読めればよい範囲は `read_paths` に入れる。file 内容を `context` に入れる場合、同じ内容を `input` にも貼らない。path-only access は `read_paths` / `write_paths` で表す。
 
 `${SUBCWD}` を使う場合、bare な `"${SUBCWD}"` は受け付けない。読む file は `read_paths=["${SUBCWD}/path"]`、書く file は `write_paths=["${SUBCWD}/path"]` のように明示する。
 
@@ -87,6 +93,8 @@ print(response.content)
 | `log_path` | auto | job ごとの activity log 出力先。 |
 
 非空 `allowed_skills` は v1 では未対応で、実行前に `ValueError` にする。sandbox と global context の詳細は `sandbox-spec.md`、logging の詳細は `logging-spec.md` を正本にする。
+
+repair attempt が発生する場合、original attempt と repair attempts は同じ main SDK thread を使う。validator / review / repair の thread lifecycle は `validation-repair-spec.md` を正本にする。
 
 ## Output
 
@@ -143,9 +151,21 @@ v1 の `read_paths` と `write_paths` は `cwd` 配下だけを受け取る。`c
 
 `allow_shell_commands=True` が既定である。shell command は使えるが、読める path と書ける path は Permission Profile に従う。
 
-`allow_shell_commands=False` の場合、wrapper は shell tool と login shell を無効化する config override を渡す。attachments の inline 挙動は shell command 設定に依存しない。
+`allow_shell_commands=False` の場合、wrapper は shell tool と login shell を無効化する config override を渡す。context の inline 挙動は shell command 設定に依存しない。
 
 command prefix ごとの allowlist / denylist は v1 API に含めない。必要な場合は Codex CLI 側の rules 設定を wrapper の外側で管理する。
+
+### Codex Runtime Features
+
+wrapper は runner job を非対話実行として扱い、次を常時渡す。
+
+- approval policy は SDK `ApprovalMode.deny_all` を `thread_start` に渡す。
+- MCP server config は `mcp_servers={}` で空にする。
+- known apps / MCP apps 経路は `features.apps=false` と `features.enable_mcp_apps=false` で抑制する。
+- multi-agent / collab は `features.multi_agent=false`、`features.multi_agent_v2=false`、`features.collaboration_modes=false` で抑制する。
+- memory は `features.memories=false`、`memories.generate_memories=false`、`memories.use_memories=false` で抑制する。
+
+`connectors={}` は現 installed Codex CLI の strict config で unknown field になるため渡さない。wrapper が抑制するのは known apps / MCP apps と `mcp_servers={}` の経路であり、将来の未知 connector 設定まで完全に無効化する保証ではない。
 
 ### Global Context
 
@@ -154,6 +174,7 @@ command prefix ごとの allowlist / denylist は v1 API に含めない。必�
 行うこと:
 
 - project doc の prompt 注入を `project_doc_max_bytes=0` で抑制する。
+- global hook を `features.hooks=false` で抑制する。
 - `allowed_skills` が未指定なら `[]` として扱い、automatic skill instructions を出さない。
 - prompt 上で global `AGENTS.md` と skills に依存しないよう指示する。
 

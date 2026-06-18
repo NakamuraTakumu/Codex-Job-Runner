@@ -20,7 +20,7 @@ Responsibility: `CodexClient` と `CodexJob` の public job API、完了判定�
 
 ## Start
 
-`start(...)` は job を起動してすぐ `CodexJob` を返す。main attempt、validator、review、repair、cleanup は job group として扱う。
+`start(...)` は job を起動してすぐ `CodexJob` を返す。main attempt、validator、review、repair、cleanup は job group として扱う。job group 内の original attempt と repair attempts は同じ main SDK thread を使う。
 
 `start(...)` の入力契約は `spec.md` を正本にし、機能別の詳細は各 feature spec に分ける。
 

@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from codex_api_wrapper import CodexClient
+from codex_job_runner import CodexClient
 
 
 HERE = Path(__file__).resolve().parent
@@ -27,10 +27,11 @@ class TemplateReviewClient(CodexClient):
         extra_input=None,
         **kwargs,
     ):
+        prompt_context = [PROMPT_PATH, target_path]
         prompt = _build_input(target_path=target_path, extra_input=extra_input)
         return super().start(
             input=prompt,
-            attachments=[target_path],
+            context=prompt_context,
             read_paths=read_paths or [target_path],
             write_paths=write_paths or [],
             output_schema_path=str(OUTPUT_SCHEMA_PATH),
@@ -39,8 +40,7 @@ class TemplateReviewClient(CodexClient):
 
 
 def _build_input(*, target_path, extra_input):
-    prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
-    sections = [prompt, f"Target path:\n{target_path}"]
+    sections = [f"Target path:\n{target_path}"]
     if extra_input:
         sections.append(f"Additional input:\n{extra_input}")
     return "\n\n".join(sections)

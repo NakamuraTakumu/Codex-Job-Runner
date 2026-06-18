@@ -11,7 +11,6 @@ from jobs.template_review import TemplateReviewClient
 
 client = TemplateReviewClient(
     cwd="/path/to/workspace",
-    timeout=300,
 )
 
 response = client.run(target_path="README.md")

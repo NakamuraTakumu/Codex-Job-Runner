@@ -1,11 +1,11 @@
-# Codex API Wrapper Validation Repair Spec
+# Codex Job Runner Validation Repair Spec
 
 - Created: 2026-06-02T00:00:00Z
-- Updated: 2026-06-03T04:05:59Z
+- Updated: 2026-06-15
 - Repository: none
 - Related-Commit: none
 
-Responsibility: `codex_api_wrapper` が Codex job の最終出力を validator script と review job で確認し、失敗時に同じ model と同じ `${SUBCWD}` を使って repair attempt を行う仕様を定義する。
+Responsibility: `codex_job_runner` が Codex job の最終出力を validator script と review job で確認し、失敗時に同じ main SDK thread、同じ model、同じ `${SUBCWD}` を使って repair attempt を行う仕様を定義する。
 
 ## Background
 
@@ -21,11 +21,13 @@ validation failure は、別 model への fallback より先に、同じ model �
 
 **validation failure**: validator が non-zero exit code で終了した状態。main attempt 自体の失敗とは区別し、`CodexValidationError` として扱う。
 
-**repair attempt**: validation failure の後、同じ model、同じ cwd、同じ permission、同じ `${SUBCWD}` を使い、repair prompt で再度 Codex job attempt を起動する attempt。
+**repair attempt**: validation failure の後、同じ main SDK thread に repair prompt を次 turn として送り、同じ model、同じ cwd、同じ permission、同じ `${SUBCWD}` を使って修正する attempt。
 
-**review job**: validator 成功後に wrapper が追加で起動する Codex job。`ReviewConfig` に基づき、主 job の `original_input`、最終応答、必要に応じて `${SUBCWD}` を見て `passed` / `repair_text` を返す。主 job に実際に渡した prompt 全体は `ReviewConfig(include_main_prompt=True)` の場合だけ含める。review job の read permission は `ReviewConfig.read_paths` があればそれを使い、なければ主 job の `read_paths` を流用する。
+**review job**: validator 成功後に wrapper が追加で起動する Codex job。`ReviewConfig` に基づき、主 job の `original_input`、最終応答、必要に応じて `${SUBCWD}` を見て `passed` / `repair_text` を返す。主 job の初期 context 全文は `ReviewConfig(include_main_context=True)` の場合だけ含める。review job の read permission は `ReviewConfig.read_paths` があればそれを使い、なければ主 job の `read_paths` を流用する。
 
 **attempt group**: original attempt と repair attempts をまとめた単位。`${SUBCWD}` の lifecycle、file collection、cleanup は attempt group 単位で扱う。
+
+**main SDK thread**: attempt group の original attempt と repair attempts が共有する SDK thread。automatic review job や `ReviewSession` が使う reviewer thread とは別に扱う。
 
 **default behavior**: validator と repair は opt-in とする。`output_validator` がない場合、既存挙動は変えない。`repair_validation_failures=False` の場合、validation failure は repair せず `CodexValidationError` にする。
 
@@ -84,7 +86,7 @@ wrapper は補助 metadata を environment variable で渡す。
 | `CODEX_WRAPPER_OUTPUT_SCHEMA_PATH` | no | `output_schema_path` が指定された場合の resolved path。 |
 | `CODEX_WRAPPER_SUBCWD` | no | `${SUBCWD}` が作られた場合の resolved path。validator はこの directory 内の file を読める。 |
 
-`attachments`、`read_paths`、`write_paths` の完全な list は v1 の validator input には含めない。validator が job output file を確認する必要がある場合は、`${SUBCWD}` を使い、`CODEX_WRAPPER_SUBCWD` 配下を読む。
+`context`、`read_paths`、`write_paths` の完全な list は v1 の validator input には含めない。validator が job output file を確認する必要がある場合は、`${SUBCWD}` を使い、`CODEX_WRAPPER_SUBCWD` 配下を読む。
 
 validator は stdin の final response と、必要なら `CODEX_WRAPPER_SUBCWD` 内の file を検証する。`response.files` は attempt group の最終状態が確定した後に回収されるため、validator には渡さない。
 
@@ -103,7 +105,6 @@ repair attempt では、元の task を自由にやり直させるのではな�
 
 default repair prompt は次の情報を含める。
 
-- original input
 - attempt number
 - validator return code
 - validator stdout
@@ -113,14 +114,13 @@ default repair prompt は次の情報を含める。
 - `${SUBCWD}` がある場合でも、既存 job の `read_paths` / `write_paths` の範囲だけを使うこと
 - final output だけを返す指示
 
+default repair prompt は repair turn 専用 builder で作る。repair turn は同じ main SDK thread の後続 turn なので、初回 main prompt に含めた context、inline context contents、read/write path section、output schema section、Pydantic model source section、ignore global context notice、review notice は thread history に残る。wrapper は repair prompt でそれらを再 render / 再注入しない。
+
 概念的な prompt:
 
 ```text
 前回の出力は validator に失敗しました。
 元の task を最初から広げ直すのではなく、validator error を満たすように前回出力と必要な file を修正してください。
-
-Original request:
-...
 
 Validator return code:
 ...
@@ -148,25 +148,27 @@ Corrected final response only:
 
 ## Execution Behavior
 
-1. wrapper は original attempt を通常通り起動する。
+1. wrapper は original attempt 用に main SDK thread を起動する。
 2. original attempt が non-zero exit の場合、validation と repair は行わず `CodexExecutionError` にする。
 3. original attempt が exit code `0` で終了したら、SDK turn の final response を読む。
 4. `output_validator` がなければ validator は skip する。
 5. validator を実行する場合、exit code `0` なら review 判定へ進む。
 6. validator が non-zero の場合、`repair_validation_failures` と `max_repairs` を確認する。
 7. repair しない場合、`CodexValidationError` を raise する。
-8. repair する場合、wrapper は repair prompt の要約を activity log に記録し、同じ model、cwd、attachments、read_paths、write_paths、permission profile 相当の設定、`output_schema_path`、schema context、`output_validator` を使い、repair prompt で次の attempt を起動する。
+8. repair する場合、wrapper は repair prompt の要約を activity log に記録し、同じ main SDK thread に repair prompt を次 turn として送り、同じ model、cwd、context、`read_paths`、`write_paths`、permission profile 相当の設定、`output_schema_path`、schema context、`output_validator` を使う。
 9. repair attempt の final response に対して validator を再実行する。
 10. validation success 後、`review` がなければ response を返す。
 11. `review` がある場合、review job を実行する。
 12. review が `passed=true` を返した場合、response を返す。
 13. review が `passed=false` を返した場合、`repair_validation_failures` と `max_review_repairs` を確認する。
 14. review repair しない場合、review result を持つ `CodexValidationError` を raise する。
-15. review repair する場合、wrapper は repair prompt の要約を activity log に記録し、`repair_text` を repair prompt に入れて次の main attempt を起動する。
+15. review repair する場合、wrapper は repair prompt の要約を activity log に記録し、`repair_text` を repair prompt に入れて同じ main SDK thread へ次 turn として送る。
 16. review output parse failure や review job execution failure は `CodexExecutionError` として扱い、repair しない。
 17. `max_repairs`、`max_validator_repairs`、または `max_review_repairs` に達しても failure が残る場合、最後の validation / review result を持つ `CodexValidationError` を raise する。
 
 `CodexJob.done()` は attempt group が成功、失敗、timeout、cancel のいずれかへ到達したときに `True` になる。individual attempt の終了だけでは `done()` にしない。
+
+wrapper は attempt group の original attempt ごとに main SDK thread を 1 つだけ作る。validator failure repair と review failure repair は、その main SDK thread の後続 turn として実行し、repair ごとに新しい main thread を作らない。job success、failure、timeout、cancel のいずれかで attempt group が閉じると、wrapper は main SDK thread を close 対象にする。
 
 ## Subcwd Lifecycle
 
@@ -212,7 +214,7 @@ review subprocess failure や review output parse failure は `CodexExecutionErr
 
 別 model への fallback はこの仕様に含めない。model fallback は wrapper の外側の orchestration policy として扱う。
 
-repair は validation failure にだけ適用する。main attempt の non-zero exit、Popen failure、permission setup failure、attachment path 不在、schema path 不在、validator path 不在には repair を適用しない。
+repair は validation failure にだけ適用する。main attempt の non-zero exit、Popen failure、permission setup failure、context path 不在、schema path 不在、validator path 不在には repair を適用しない。
 
 repair は同じ model を使う。caller が別 model で再実行したい場合は、`CodexValidationError` を受け取った後に外側で新しい call を行う。
 

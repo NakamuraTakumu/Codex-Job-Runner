@@ -1,11 +1,11 @@
-# Codex API Wrapper Subcwd Spec
+# Codex Job Runner Subcwd Spec
 
 - Created: 2026-06-01T10:31:37Z
 - Updated: 2026-06-01T10:57:26Z
 - Repository: none
 - Related-Commit: none
 
-Responsibility: `codex_api_wrapper` の job ごとに衝突しない workspace directory を作り、wrapper-managed input staging と file collection を含む `${SUBCWD}` 仕様を定義する。
+Responsibility: `codex_job_runner` の job ごとに衝突しない workspace directory を作り、wrapper-managed input staging と file collection を含む `${SUBCWD}` 仕様を定義する。
 
 ## Background
 
@@ -48,7 +48,7 @@ Responsibility: `codex_api_wrapper` の job ごとに衝突しない workspace d
 | `{"path/in/subcwd.txt": {"text": "..."}}` | UTF-8 text などの text file を staged する。 |
 | `{"path/in/subcwd.bin": {"bytes": b"..."}}` | binary file を staged する。 |
 
-bare な `${SUBCWD}` は `read_paths` / `write_paths` / `attachments` のいずれでも受け取らない。`${SUBCWD}` の staged input は wrapper が専用 API と prompt 通知で扱うが、実際の read/write 権限は `${SUBCWD}/...` を明示した path だけに限定する。
+bare な `${SUBCWD}` は `read_paths` / `write_paths` / `context` のいずれでも受け取らない。`${SUBCWD}` の staged input は wrapper が専用 API と prompt 通知で扱うが、実際の read/write 権限は `${SUBCWD}/...` を明示した path だけに限定する。
 
 `CodexClient(..., subcwd_root=...)` は `${SUBCWD}` を使う job の親ディレクトリを指定する。`cwd` 相対または absolute path を受け付けるが、resolved `cwd` 配下のみ許可する。`${SUBCWD}` token は受け付けない。`start(...)` と `run(...)` に per-call override は追加しない。
 
