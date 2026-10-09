@@ -1,3 +1,3 @@
-from .client import DemoCompanyAnalysisClient
+from .client import DemoCompanyAnalysisJob
 
-__all__ = ["DemoCompanyAnalysisClient"]
+__all__ = ["DemoCompanyAnalysisJob"]

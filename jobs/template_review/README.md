@@ -7,12 +7,16 @@
 ## Usage
 
 ```python
-from jobs.template_review import TemplateReviewClient
+from codex_job_runner import SessionConfig, WorkspaceConfig
+from jobs.template_review import TemplateReviewJob
 
-client = TemplateReviewClient(
-    cwd="/path/to/workspace",
+job = TemplateReviewJob(
+    config=SessionConfig(
+        workspace=WorkspaceConfig(cwd="/path/to/workspace"),
+    ),
+    target_path="README.md",
 )
 
-response = client.run(target_path="README.md")
+response = job.run()
 print(response.content)
 ```

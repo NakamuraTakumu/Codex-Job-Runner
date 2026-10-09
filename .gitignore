@@ -21,6 +21,7 @@ venv/
 .env.local
 
 # Temporary outputs
+.worktree/
 tmp/
 tmp_*/
 tmp_pdf/

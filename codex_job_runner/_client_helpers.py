@@ -8,10 +8,13 @@ import inspect
 import json
 import os
 import pathlib
+import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import traceback
 import uuid
 
@@ -21,14 +24,26 @@ from ._constants import (
     _MODEL_PRICING_USD_PER_MILLION,
     _SUBCWD_TOKEN,
 )
-from ._models import ReviewConfig, _ResolvedReviewConfig, _SubcwdFile, _ValidationResult
+from ._models import (
+    ReviewConfig,
+    _ResolvedReviewConfig,
+    _SubcwdFile,
+    _ValidationResult,
+)
 from .errors import CodexExecutionError, CodexValidationError
 from .types import CodexActivity, CodexFile
 
+
+# Exact-file writes are enabled on Linux/WSL only after the selected Codex
+# runtime has been verified end-to-end.  Keep this allow-list empty until such
+# a runtime is recorded by a live capability test.
+_EXACT_FILE_WRITE_SUPPORTED_LINUX_CODEX_VERSIONS = frozenset()
+_SDK_SESSION_TMPFS_ROOT = pathlib.Path("/dev/shm")
+
 def _build_prompt(
     *,
-    input,
     context_paths,
+    input_paths,
     read_paths,
     write_paths,
     subcwd_files,
@@ -38,12 +53,48 @@ def _build_prompt(
     output_schema_section=None,
     output_model_source_section=None,
     review_notice=None,
+    input_sections=None,
+    subagent_context_policy=None,
 ):
-    sections = []
+    sections = [
+        "Native collaboration tools are prohibited. Do not call Codex's "
+        "built-in spawn_agent, send_input, wait, resume_agent, or close_agent "
+        "tools. Runner-managed subagent tools served by the codex_job_runner "
+        "MCP server are not native tools, even when they share a name such as "
+        "spawn_agent; when they are available, use only the "
+        "codex_job_runner MCP tools for subagents."
+    ]
     if ignore_global_context:
         sections.append(
             "Global AGENTS.md and global skills should not be used for this job. "
             "Use only the request below and explicitly supplied context."
+        )
+    if subagent_context_policy is not None:
+        fork_context = (
+            "true" if subagent_context_policy == "all" else "false"
+        )
+        subagent_instruction = (
+            "Native V1 subagents are ON.\n"
+            "You may use the native spawn_agent tool for independent work. "
+            "For every spawn_agent call, set "
+            f"fork_context={fork_context}. Spawned descendants inherit this "
+            "job's Permission Profile. "
+        )
+        if write_paths:
+            subagent_instruction += (
+                "Only the parent may use file-writing tools. In every subagent "
+                "task, explicitly prohibit all file modifications and require "
+                "the result in the subagent's final response. This restriction "
+                "is instruction-level because descendants technically inherit "
+                "the parent's write permissions. "
+            )
+        else:
+            subagent_instruction += "This job's Permission Profile is read-only. "
+        sections.append(
+            subagent_instruction
+            + "The wrapper requests this "
+            "context policy through instructions; the model selects the "
+            "spawn_agent arguments."
         )
     if context_sections:
         sections.append("Context:\n" + "\n\n".join(context_sections))
@@ -77,7 +128,10 @@ def _build_prompt(
             f"{_SUBCWD_TOKEN}/... path is covered by this job's read_paths "
             "or write_paths."
         )
-    sections.append(input.strip())
+    if input_paths:
+        sections.append(_format_path_section("Input paths", input_paths))
+    if input_sections:
+        sections.extend(input_sections)
     return "\n\n".join(sections) + "\n"
 
 
@@ -123,6 +177,20 @@ def _build_review_input(
     for key, value in values.items():
         review_input = review_input.replace("{" + key + "}", value)
     return review_input
+
+
+def _build_review_delta_input(*, response):
+    return (
+        "Internal review continuation: codex_job_runner\n"
+        "The main job revised its output after the preceding review findings. "
+        "Re-review the revised result against the original request and review "
+        "context already present in this reviewer thread. If the original "
+        "request or review context identifies a canonical artifact, re-read that "
+        "artifact through the previously granted filesystem path; do not treat "
+        "the revised final response below as a substitute for the artifact.\n\n"
+        "Revised main job final response:\n"
+        f"{response.content}"
+    )
 
 
 def _format_path_section(title, paths):
@@ -195,7 +263,9 @@ def _resolve_inline_context_sections(
     return sections
 
 
-def _normalize_context_items(context, cwd):
+def _normalize_context_items(
+    context, cwd, *, field_name="context", string_paths=True
+):
     if context is None:
         return []
     if isinstance(context, (str, os.PathLike)):
@@ -203,24 +273,90 @@ def _normalize_context_items(context, cwd):
     else:
         raw_items = list(context)
     normalized_entries = []
-    for item in raw_items:
+    for index, item in enumerate(raw_items):
+        item_field_name = f"{field_name}[{index}]"
         if isinstance(item, os.PathLike):
-            normalized_entries.append(("path", _normalize_path(item, cwd, must_exist=True)))
+            normalized_entries.append(
+                (
+                    "path",
+                    _normalize_path(
+                        item,
+                        cwd,
+                        must_exist=True,
+                        field_name=item_field_name,
+                    ),
+                )
+            )
             continue
         if not isinstance(item, str):
-            raise ValueError("context entries must be strings or paths")
+            raise ValueError(f"{field_name} entries must be strings or paths")
         if not item.strip():
-            raise ValueError("context entries must be non-empty")
+            raise ValueError(f"{field_name} entries must be non-empty")
+        if not string_paths:
+            normalized_entries.append(("text", item.strip()))
+            continue
         candidate = pathlib.Path(item).expanduser()
         if not candidate.is_absolute():
             candidate = cwd / candidate
         if candidate.exists():
-            normalized_entries.append(("path", candidate.resolve()))
+            normalized_entries.append(
+                (
+                    "path",
+                    _normalize_path(
+                        item,
+                        cwd,
+                        must_exist=True,
+                        field_name=item_field_name,
+                    ),
+                )
+            )
             continue
         if _looks_like_context_path(item):
             raise FileNotFoundError(str(candidate.resolve()))
         normalized_entries.append(("text", item.strip()))
     return normalized_entries
+
+
+def _resolve_inline_input_sections(**kwargs):
+    context_entries = kwargs["context_entries"]
+    rendered = iter(_resolve_inline_context_sections(**kwargs))
+    should_inline = (
+        True
+        if kwargs["inline_context"] is None
+        else bool(kwargs["inline_context"])
+    )
+    sections = []
+    for kind, value in context_entries:
+        if kind == "text":
+            section = next(rendered)
+            sections.append(
+                section[len("<ContextText>\n") : -len("\n</ContextText>")]
+            )
+            continue
+        sections.append(_format_path_section("Input paths", [value]))
+        if (
+            should_inline
+            and value.is_file()
+            and not value.is_symlink()
+        ):
+            sections.append(
+                next(rendered)
+                .replace("<ContextFile ", "<InputFile ")
+                .replace("</ContextFile>", "</InputFile>")
+            )
+    return sections
+
+
+def _inline_context_file_bytes(context_entries, *, inline_context):
+    if inline_context is not None and not bool(inline_context):
+        return 0
+    return sum(
+        value.stat().st_size
+        for kind, value in context_entries
+        if kind == "path"
+        and value.is_file()
+        and not value.is_symlink()
+    )
 
 
 def _context_paths_from_entries(context_entries):
@@ -355,13 +491,11 @@ def _estimate_cost_usd_for_usage(*, usage, pricing):
     input_tokens = usage.get("input_tokens", 0)
     cached_input_tokens = usage.get("cached_input_tokens", 0)
     output_tokens = usage.get("output_tokens", 0)
-    reasoning_output_tokens = usage.get("reasoning_output_tokens", 0)
-    output_billed_tokens = output_tokens + reasoning_output_tokens
     non_cached_input_tokens = max(input_tokens - cached_input_tokens, 0)
     input_cost = non_cached_input_tokens * float(pricing["input_usd_per_million"]) / 1_000_000
     cached_input_rate = float(pricing.get("cached_input_usd_per_million", 0.0))
     cached_input_cost = cached_input_tokens * cached_input_rate / 1_000_000
-    output_cost = output_billed_tokens * float(pricing["output_usd_per_million"]) / 1_000_000
+    output_cost = output_tokens * float(pricing["output_usd_per_million"]) / 1_000_000
     return input_cost + cached_input_cost + output_cost
 
 
@@ -431,6 +565,8 @@ def _stream_activity_from_line(line, *, detail=None, attempt=None, repair_index=
     event_type = event.get("type")
     if not isinstance(event_type, str):
         return None
+    if not _stream_event_has_display_content(event):
+        return None
     message = f"stream event observed: {event_type}"
     if event_type in {"item.completed", "item.delta"}:
         item_type = event.get("item_type")
@@ -439,6 +575,8 @@ def _stream_activity_from_line(line, *, detail=None, attempt=None, repair_index=
             message = f"stream event observed: {event_type} ({item_type}): {item_text}"
         elif isinstance(item_type, str):
             message = f"stream event observed: {event_type} ({item_type})"
+    elif event_type == "subagent.lifecycle":
+        message = _describe_subagent_event(event)
     elif event_type == "plan.updated":
         summary = event.get("summary")
         if isinstance(summary, str) and summary:
@@ -452,6 +590,22 @@ def _stream_activity_from_line(line, *, detail=None, attempt=None, repair_index=
         repair_index=repair_index,
         stdout=line,
     )
+
+
+def _stream_event_has_display_content(event):
+    """Return whether an event should produce an activity display line."""
+    event_type = event.get("type")
+    if event_type == "item.completed":
+        return _has_meaningful_activity_text(event.get("item_text"))
+    if event_type == "item.delta":
+        return _has_meaningful_activity_text(event.get("delta_text"))
+    if event_type == "plan.updated":
+        return _has_meaningful_activity_text(event.get("summary"))
+    return True
+
+
+def _has_meaningful_activity_text(value):
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _stream_item_text(item):
@@ -471,7 +625,79 @@ def _stream_item_text(item):
         return _truncate_activity_text(_describe_mcp_tool_call(item))
     if item_type == "fileChange":
         return _truncate_activity_text(_describe_file_change(item))
+    if item_type == "commandExecution":
+        return _describe_command_execution(item)
     return ""
+
+
+def _enum_text(value):
+    enum_value = getattr(value, "value", value)
+    return enum_value if isinstance(enum_value, str) else ""
+
+
+def _subagent_stream_event(item, *, lifecycle):
+    item_type = getattr(item, "type", None)
+    if item_type == "collabAgentToolCall":
+        agents_states = {}
+        for thread_id, state in getattr(item, "agents_states", {}).items():
+            status = _enum_text(getattr(state, "status", None))
+            if status:
+                agents_states[str(thread_id)] = status
+        event = {
+            "type": "subagent.lifecycle",
+            "source": "collab_tool",
+            "lifecycle": lifecycle,
+            "tool": _enum_text(getattr(item, "tool", None)),
+            "call_status": _enum_text(getattr(item, "status", None)),
+            "sender_thread_id": getattr(item, "sender_thread_id", ""),
+            "receiver_thread_ids": list(
+                getattr(item, "receiver_thread_ids", ()) or ()
+            ),
+            "agent_states": agents_states,
+        }
+        model = getattr(item, "model", None)
+        if isinstance(model, str) and model:
+            event["model"] = model
+        effort = _enum_text(getattr(item, "reasoning_effort", None))
+        if effort:
+            event["reasoning_effort"] = effort
+        prompt = getattr(item, "prompt", None)
+        if isinstance(prompt, str) and prompt:
+            event["prompt"] = prompt
+        return event
+    if item_type == "subAgentActivity":
+        return {
+            "type": "subagent.lifecycle",
+            "source": "activity",
+            "lifecycle": lifecycle,
+            "kind": _enum_text(getattr(item, "kind", None)),
+            "agent_thread_id": getattr(item, "agent_thread_id", ""),
+            "agent_path": getattr(item, "agent_path", ""),
+        }
+    return None
+
+
+def _describe_subagent_event(event):
+    source = event.get("source")
+    lifecycle = event.get("lifecycle", "")
+    if source == "activity":
+        return (
+            "subagent activity observed: "
+            f"lifecycle={lifecycle} kind={event.get('kind', '')} "
+            f"thread={event.get('agent_thread_id', '')}"
+        ).strip()
+    states = event.get("agent_states") or {}
+    state_text = ",".join(
+        f"{thread_id}:{status}"
+        for thread_id, status in sorted(states.items())
+    )
+    return (
+        "subagent collaboration observed: "
+        f"lifecycle={lifecycle} tool={event.get('tool', '')} "
+        f"call_status={event.get('call_status', '')} "
+        f"receivers={','.join(event.get('receiver_thread_ids') or [])} "
+        f"states={state_text}"
+    ).strip()
 
 
 def _extract_reasoning_text(value):
@@ -510,7 +736,7 @@ def _describe_web_search(item):
             return f"search {query}"
         queries = getattr(action_root, "queries", None) or []
         if queries:
-            return "search " + ", ".join(str(part) for part in queries[:3] if part)
+            return "search " + ", ".join(str(part) for part in queries if part)
     if action_type == "openPage":
         url = getattr(action_root, "url", None)
         if isinstance(url, str) and url.strip():
@@ -522,10 +748,10 @@ def _describe_web_search(item):
             return f"find {pattern} in {url}"
         if isinstance(pattern, str) and pattern.strip():
             return f"find {pattern}"
+    # Never return empty: an unlogged web action would make the audit undercount.
     query = getattr(item, "query", None)
-    if isinstance(query, str) and query.strip():
-        return f"query {query}"
-    return ""
+    query = query.strip() if isinstance(query, str) else ""
+    return f"{action_type or 'unknown'} action {query}".strip()
 
 
 def _summarize_agent_message_text(text):
@@ -571,9 +797,10 @@ def _describe_mcp_tool_call(item):
         details.append(tool)
     if isinstance(status, str) and status:
         details.append(status)
-    result_text = _extract_tool_result_text(result)
-    if result_text:
-        details.append(result_text)
+    if server != "codex_job_runner":
+        result_text = _extract_tool_result_text(result)
+        if result_text:
+            details.append(result_text)
     return " ".join(details)
 
 
@@ -602,6 +829,13 @@ def _extract_tool_result_text(result):
     if structured:
         return _summarize_mapping(structured)
     return ""
+
+
+def _describe_command_execution(item):
+    # The full command is kept untruncated so the log can audit what was run.
+    command = " ".join(str(getattr(item, "command", "") or "").split())
+    exit_code = getattr(item, "exit_code", None)
+    return f"$ {command} (exit={exit_code})" if command else ""
 
 
 def _describe_file_change(item):
@@ -682,6 +916,59 @@ def _format_stream_activity_stdout(entry):
     except json.JSONDecodeError:
         event = {}
     event_type = event.get("type")
+    if event_type == "subagent.lifecycle":
+        source = event.get("source")
+        if source == "activity":
+            kind = event.get("kind") or "Activity"
+            label = {
+                "started": "Start",
+                "interacted": "Activity",
+                "interrupted": "Stop",
+            }.get(kind, "Activity")
+            parts = [f"[Subagent][{label}]"]
+            thread_id = event.get("agent_thread_id")
+            if thread_id:
+                parts.append(f"thread={thread_id}")
+            agent_path = event.get("agent_path")
+            if agent_path:
+                parts.append(f"path={agent_path}")
+            parts.append(f"lifecycle={event.get('lifecycle', '')}")
+            return " ".join(parts)
+        tool = event.get("tool") or "collaboration"
+        label = {
+            "spawnAgent": "Spawn",
+            "sendInput": "Input",
+            "resumeAgent": "Resume",
+            "wait": "Wait",
+            "closeAgent": "Close",
+        }.get(tool, "Lifecycle")
+        parts = [f"[Subagent][{label}]"]
+        parts.append(f"lifecycle={event.get('lifecycle', '')}")
+        call_status = event.get("call_status")
+        if call_status:
+            parts.append(f"call_status={call_status}")
+        receivers = event.get("receiver_thread_ids") or []
+        if receivers:
+            parts.append("receivers=" + ",".join(receivers))
+        states = event.get("agent_states") or {}
+        if states:
+            parts.append(
+                "states="
+                + ",".join(
+                    f"{thread_id}:{status}"
+                    for thread_id, status in sorted(states.items())
+                )
+            )
+        model = event.get("model")
+        if model:
+            parts.append(f"model={model}")
+        effort = event.get("reasoning_effort")
+        if effort:
+            parts.append(f"effort={effort}")
+        prompt = event.get("prompt")
+        if isinstance(prompt, str) and prompt:
+            parts.append(f"prompt={_stdout_field_text(prompt)}")
+        return " ".join(parts)
     actor = _stream_actor(entry)
     if event_type == "item.completed":
         item_type = event.get("item_type", "?")
@@ -818,6 +1105,7 @@ def _stream_item_label(item_type):
         "webSearch": "Search",
         "mcpToolCall": "Tool",
         "fileChange": "Edit",
+        "commandExecution": "Shell",
     }.get(item_type, "Item")
 
 
@@ -883,32 +1171,163 @@ def _import_openai_codex():
         ) from exc
 
 
-def _codex_runtime_read_paths():
+def _codex_runtime_read_paths(codex_bin=None):
+    paths = []
     try:
         spec = importlib.util.find_spec("openai_codex")
     except (ImportError, AttributeError, ValueError):
-        return []
-    if spec is None:
-        return []
+        spec = None
+    if spec is not None:
+        candidate = None
+        locations = getattr(spec, "submodule_search_locations", None)
+        if locations:
+            candidate = next(iter(locations), None)
+        if candidate is None:
+            origin = getattr(spec, "origin", None)
+            if origin and origin != "built-in":
+                candidate = pathlib.Path(origin).parent
+        if candidate is not None:
+            try:
+                package_path = pathlib.Path(candidate).expanduser().resolve()
+                if package_path.exists():
+                    paths.append(package_path)
+            except (OSError, RuntimeError):
+                pass
 
-    candidate = None
-    locations = getattr(spec, "submodule_search_locations", None)
-    if locations:
-        candidate = next(iter(locations), None)
-    if candidate is None:
-        origin = getattr(spec, "origin", None)
-        if origin and origin != "built-in":
-            candidate = pathlib.Path(origin).parent
-    if candidate is None:
-        return []
+    runtime_path = _selected_codex_runtime_path(codex_bin)
+    if runtime_path is not None:
+        host_name = "codex-code-mode-host.exe" if os.name == "nt" else "codex-code-mode-host"
+        host_path = runtime_path.parent / host_name
+        try:
+            if host_path.is_file() and runtime_path.parent not in paths:
+                paths.append(runtime_path.parent)
+        except OSError:
+            pass
+    return paths
 
+
+def _selected_codex_runtime_path(codex_bin):
     try:
+        if codex_bin is None:
+            runtime_package = importlib.import_module("codex_cli_bin")
+            candidate = runtime_package.bundled_codex_path()
+        else:
+            candidate = codex_bin
         path = pathlib.Path(candidate).expanduser().resolve()
-    except OSError:
-        return []
-    if not path.exists():
-        return []
-    return [path]
+        return path if path.is_file() else None
+    except (ImportError, AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _codex_runtime_version(runtime_path):
+    if runtime_path is None:
+        return None, []
+    argv = [str(runtime_path), "--version"]
+    try:
+        completed = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None, argv
+    output = "\n".join((completed.stdout or "", completed.stderr or ""))
+    match = re.search(r"\bcodex-cli\s+([^\s]+)", output)
+    if completed.returncode != 0 or match is None:
+        return None, argv
+    return match.group(1), argv
+
+
+def _enforce_write_path_runtime_capability(
+    *,
+    cwd,
+    raw_write_paths,
+    write_paths,
+    subcwd_path,
+    codex_bin,
+):
+    """Fail closed for unverified Linux exact-file write permission rules."""
+    cwd = pathlib.Path(cwd).resolve()
+    for path in write_paths:
+        if not _is_relative_to(path, cwd):
+            raise ValueError(f"path must be inside cwd for permission profiles: {path}")
+
+    # Preserve the established Windows/macOS runtime behavior.  WSL reports a
+    # Linux sys.platform and therefore follows the Linux capability gate.
+    if not sys.platform.startswith("linux") or not write_paths:
+        return
+
+    offenders = []
+    for raw, resolved in zip(raw_write_paths, write_paths):
+        display, lexical_path = _write_path_gate_display_and_lexical_path(
+            raw,
+            cwd=cwd,
+            subcwd_path=subcwd_path,
+        )
+        try:
+            is_symlink = lexical_path.is_symlink()
+            if is_symlink:
+                if resolved.is_dir():
+                    continue
+                kind = "symlink-to-file" if resolved.is_file() else "unknown"
+                offenders.append((display, kind))
+                continue
+            if resolved.is_dir():
+                continue
+            if resolved.exists() and resolved.is_file():
+                offenders.append((display, "regular-file"))
+            else:
+                offenders.append((display, "unknown"))
+        except OSError:
+            offenders.append((display, "unknown"))
+
+    if not offenders:
+        return
+
+    runtime_path = _selected_codex_runtime_path(codex_bin)
+    if runtime_path is None:
+        runtime_version, version_argv = None, []
+    else:
+        runtime_version, version_argv = _codex_runtime_version(runtime_path)
+    only_verified_exact_files = all(kind == "regular-file" for _, kind in offenders)
+    if (
+        only_verified_exact_files
+        and runtime_path is not None
+        and runtime_version in _EXACT_FILE_WRITE_SUPPORTED_LINUX_CODEX_VERSIONS
+    ):
+        return
+
+    platform_name = f"{sys.platform} ({platform.platform()})"
+    runtime_display = str(runtime_path) if runtime_path is not None else "<unknown>"
+    version_display = runtime_version if runtime_version is not None else "<unavailable>"
+    offending_display = ", ".join(
+        f"{path} [{kind}]" for path, kind in offenders
+    )
+    raise CodexExecutionError(
+        "exact-file write capability is not verified for the selected Linux/WSL "
+        "runtime; "
+        f"platform={platform_name}; runtime_path={runtime_display}; "
+        f"runtime_version={version_display}; "
+        f"offending_write_paths={offending_display}. "
+        "Use codex_bin to select a verified runtime or grant an existing directory "
+        "write path.",
+        argv=version_argv,
+    )
+
+
+def _write_path_gate_display_and_lexical_path(raw, *, cwd, subcwd_path):
+    text = _path_text(raw)
+    if text == _SUBCWD_TOKEN or text.startswith(_SUBCWD_TOKEN + "/"):
+        suffix = text[len(_SUBCWD_TOKEN) :].lstrip("/")
+        lexical = subcwd_path if not suffix else subcwd_path / suffix
+        return text, lexical
+    lexical = pathlib.Path(text).expanduser()
+    if not lexical.is_absolute():
+        lexical = cwd / lexical
+    return text, lexical
 
 
 def _normalize_sdk_usage(usage):
@@ -968,19 +1387,32 @@ def _render_pydantic_output_schema_json(model):
 
 
 def _strip_structured_output_schema_metadata(value):
+    return _strip_structured_output_schema_metadata_in_scope(value, in_properties=False)
+
+
+def _strip_structured_output_schema_metadata_in_scope(value, *, in_properties):
     if isinstance(value, list):
-        return [_strip_structured_output_schema_metadata(item) for item in value]
+        return [
+            _strip_structured_output_schema_metadata_in_scope(
+                item,
+                in_properties=False,
+            )
+            for item in value
+        ]
     if not isinstance(value, dict):
         return value
     if "$ref" in value:
         return {"$ref": value["$ref"]}
     stripped = {}
     for key, item in value.items():
-        if key in {"description", "title", "examples", "default"}:
+        if not in_properties and key in {"description", "title", "examples", "default"}:
             continue
         if isinstance(key, str) and key.startswith("x-"):
             continue
-        stripped[key] = _strip_structured_output_schema_metadata(item)
+        stripped[key] = _strip_structured_output_schema_metadata_in_scope(
+            item,
+            in_properties=(key == "properties"),
+        )
     return stripped
 
 
@@ -1005,23 +1437,30 @@ def _render_pydantic_model_source_context(model):
     )
 
 
+
+
 def _run_pydantic_validation(*, model, content):
-    argv = ["pydantic", _pydantic_model_label(model)]
     try:
         model.model_validate_json(content)
     except Exception as exc:
         return _ValidationResult(
-            returncode=1,
-            stdout="",
-            stderr=f"pydantic validation failed for {_pydantic_model_label(model)}:\n{exc}",
-            argv=argv,
+            success=False,
+            diagnostic=(
+                f"pydantic validation failed for {_pydantic_model_label(model)}:\n{exc}"
+            ),
         )
-    return _ValidationResult(
-        returncode=0,
-        stdout="",
-        stderr=f"pydantic validation passed for {_pydantic_model_label(model)}",
-        argv=argv,
-    )
+    return _ValidationResult(success=True)
+
+
+def _make_pydantic_output_validator(model):
+    """Adapt local Pydantic validation to the standard validator contract."""
+
+    def validate(response):
+        result = _run_pydantic_validation(model=model, content=response.content)
+        if not result.success:
+            raise ValueError(result.diagnostic or "output validation failed")
+
+    return validate
 
 
 def _append_stream_event(stdout_lines, process, event):
@@ -1044,6 +1483,23 @@ def _consume_turn_via_stream(process, turn):
         for event in stream:
             method = getattr(event, "method", "")
             payload = getattr(event, "payload", None)
+            if method in {"item/started", "item.started"}:
+                item = getattr(payload, "item", None)
+                if item is None:
+                    continue
+                item_payload = getattr(item, "root", item)
+                _reject_native_collaboration(turn, item_payload)
+                subagent_event = _subagent_stream_event(
+                    item_payload,
+                    lifecycle="started",
+                )
+                if subagent_event is not None:
+                    _append_stream_event(
+                        stdout_lines,
+                        process,
+                        subagent_event,
+                    )
+                continue
             if method in {"item/agentMessage/delta", "item.agentMessage.delta"}:
                 delta = getattr(payload, "delta", None)
                 if isinstance(delta, str) and delta:
@@ -1076,6 +1532,18 @@ def _consume_turn_via_stream(process, turn):
                     continue
                 items.append(item)
                 item_payload = getattr(item, "root", item)
+                _reject_native_collaboration(turn, item_payload)
+                subagent_event = _subagent_stream_event(
+                    item_payload,
+                    lifecycle="completed",
+                )
+                if subagent_event is not None:
+                    _append_stream_event(
+                        stdout_lines,
+                        process,
+                        subagent_event,
+                    )
+                    continue
                 item_type = getattr(item_payload, "type", None)
                 if not isinstance(item_type, str):
                     item_type = type(item_payload).__name__
@@ -1117,6 +1585,24 @@ def _consume_turn_via_stream(process, turn):
         final_response,
         usage,
         items,
+    )
+
+
+def _reject_native_collaboration(turn, item):
+    if getattr(item, "type", None) not in {
+        "collabAgentToolCall",
+        "subAgentActivity",
+    }:
+        return
+    interrupt = getattr(turn, "interrupt", None)
+    if interrupt is not None:
+        try:
+            interrupt()
+        except Exception:
+            pass
+    raise RuntimeError(
+        "native collaboration tools are prohibited by codex-job-runner; "
+        "use only Runner-managed subagent tools"
     )
 
 
@@ -1168,17 +1654,24 @@ def _xml_attr(value):
     )
 
 
-def _normalize_paths(paths, cwd, *, must_exist):
+def _normalize_paths(paths, cwd, *, must_exist, field_name="paths"):
     normalized = []
-    for raw in paths:
-        normalized.append(_normalize_path(raw, cwd, must_exist=must_exist))
+    for index, raw in enumerate(paths):
+        normalized.append(
+            _normalize_path(
+                raw,
+                cwd,
+                must_exist=must_exist,
+                field_name=f"{field_name}[{index}]",
+            )
+        )
     return normalized
 
 
-def _normalize_optional_path(path, cwd, *, must_exist):
+def _normalize_optional_path(path, cwd, *, must_exist, field_name="path"):
     if path is None:
         return None
-    return _normalize_path(path, cwd, must_exist=must_exist)
+    return _normalize_path(path, cwd, must_exist=must_exist, field_name=field_name)
 
 
 def _normalize_review_config(review, cwd):
@@ -1191,33 +1684,38 @@ def _normalize_review_config(review, cwd):
         review.prompt_path,
         cwd,
         must_exist=True,
+        field_name="review.prompt_path",
     )
     prompt_template = None
     if prompt_path is not None:
         prompt_template = prompt_path.read_text(encoding="utf-8")
-    normalized_read_paths = None
-    if review.read_paths is not None:
-        normalized_read_paths = tuple(_normalize_raw_path_list(review.read_paths, "review.read_paths"))
-    timeout = review.timeout
+    normalized_read_paths = (
+        tuple(review.session.workspace.read_paths) or None
+    )
+    timeout = review.session.timeout
     if timeout is not None and not isinstance(timeout, (int, float)):
         raise ValueError("review.timeout must be numeric or None")
     if not isinstance(review.reuse_session, bool):
         raise ValueError("review.reuse_session must be a bool")
     if not isinstance(review.include_main_context, bool):
         raise ValueError("review.include_main_context must be a bool")
+    if not isinstance(review.enable_peer_exchange, bool):
+        raise ValueError("review.enable_peer_exchange must be a bool")
     return _ResolvedReviewConfig(
+        session=review.session,
         context=review_context,
         prompt_template=prompt_template,
         read_paths=normalized_read_paths,
         timeout=timeout,
-        model=review.model,
-        reasoning_effort=_normalize_optional_reasoning_effort(
-            review.reasoning_effort
-        )
-        if review.reasoning_effort is not None
-        else None,
+        model=review.session.model,
+        reasoning_effort=review.session.reasoning_effort,
         reuse_session=review.reuse_session,
         include_main_context=review.include_main_context,
+        enable_peer_exchange=review.enable_peer_exchange,
+        subagents_enabled=False,
+        subagents=review.subagents,
+        artifact_paths=tuple(review.artifact_paths),
+        max_repairs=review.max_repairs,
     )
 
 
@@ -1237,23 +1735,6 @@ def _normalize_review_context(context):
     if not normalized:
         raise ValueError("review.context must not be empty")
     return tuple(normalized)
-
-
-def _normalize_output_validator(output_validator, cwd):
-    if output_validator is None:
-        return None
-    if isinstance(output_validator, (str, os.PathLike)):
-        argv = [os.fspath(output_validator)]
-    else:
-        argv = [os.fspath(item) for item in output_validator]
-    if not argv:
-        raise ValueError("output_validator must not be empty")
-    if not all(isinstance(item, str) and item for item in argv):
-        raise ValueError("output_validator entries must be non-empty strings")
-    head = argv[0]
-    if _looks_like_path(head):
-        argv[0] = str(_normalize_path(head, cwd, must_exist=True))
-    return argv
 
 
 def _normalize_raw_path_list(paths, field_name):
@@ -1289,7 +1770,7 @@ def _reject_subcwd_token(paths, field_name):
 
 def _normalize_subcwd_paths(paths, cwd, subcwd_path, *, must_exist, field_name):
     normalized = []
-    for raw in paths:
+    for index, raw in enumerate(paths):
         text = _path_text(raw)
         if _SUBCWD_TOKEN in text:
             normalized.append(
@@ -1303,7 +1784,14 @@ def _normalize_subcwd_paths(paths, cwd, subcwd_path, *, must_exist, field_name):
             if must_exist and not normalized[-1].exists():
                 raise FileNotFoundError(normalized[-1])
             continue
-        normalized.append(_normalize_path(raw, cwd, must_exist=must_exist))
+        normalized.append(
+            _normalize_path(
+                raw,
+                cwd,
+                must_exist=must_exist,
+                field_name=f"{field_name}[{index}]",
+            )
+        )
     return normalized
 
 
@@ -1341,7 +1829,7 @@ def _normalize_subcwd_root(raw, cwd):
     text = _path_text(raw)
     if _SUBCWD_TOKEN in text:
         raise ValueError(f"subcwd_root does not accept {_SUBCWD_TOKEN}")
-    path = _normalize_path(raw, cwd, must_exist=False)
+    path = _normalize_path(raw, cwd, must_exist=False, field_name="subcwd_root")
     if not _is_relative_to(path, cwd):
         raise ValueError(f"subcwd_root must be inside cwd: {path}")
     return path
@@ -1456,8 +1944,8 @@ def _parse_review_output(content, *, stdout, stderr, argv):
             argv=argv,
         )
     passed = parsed.get("passed")
-    repair_text = parsed.get("repair_text")
-    summary = parsed.get("summary", "")
+    findings = parsed.get("findings")
+    summary = parsed.get("summary")
     if not isinstance(passed, bool):
         raise CodexExecutionError(
             "codex review output requires boolean passed",
@@ -1466,9 +1954,12 @@ def _parse_review_output(content, *, stdout, stderr, argv):
             stderr=stderr,
             argv=argv,
         )
-    if not isinstance(repair_text, str):
+    if not isinstance(findings, list) or any(
+        not isinstance(finding, str) or not finding.strip()
+        for finding in findings
+    ):
         raise CodexExecutionError(
-            "codex review output requires string repair_text",
+            "codex review output requires findings as an array of non-empty strings",
             returncode=None,
             stdout=stdout,
             stderr=stderr,
@@ -1482,9 +1973,9 @@ def _parse_review_output(content, *, stdout, stderr, argv):
             stderr=stderr,
             argv=argv,
         )
-    if not passed and not repair_text.strip():
+    if not passed and not findings:
         raise CodexExecutionError(
-            "codex review output requires non-empty repair_text when passed is false",
+            "codex review output requires at least one finding when passed is false",
             returncode=None,
             stdout=stdout,
             stderr=stderr,
@@ -1492,7 +1983,7 @@ def _parse_review_output(content, *, stdout, stderr, argv):
         )
     return {
         "passed": passed,
-        "repair_text": repair_text,
+        "findings": tuple(findings),
         "summary": summary,
     }
 
@@ -1504,7 +1995,7 @@ def _review_failure_message(review):
     return "codex review reported issues"
 
 
-def _normalize_path(raw, cwd, *, must_exist):
+def _normalize_path(raw, cwd, *, must_exist, field_name):
     path = pathlib.Path(raw).expanduser()
     if not path.is_absolute():
         path = cwd / path
@@ -1564,6 +2055,19 @@ def _cleanup_tree(path):
         shutil.rmtree(path)
     except FileNotFoundError:
         pass
+
+
+def _archive_rollouts(home, destination):
+    """Copy the SDK's complete conversation records out of an isolated home.
+
+    The event stream omits some tool calls (e.g. Code Mode web actions), so the
+    rollout files are the only full record of what a session did.
+    """
+    if home is None:
+        return
+    for path in sorted((pathlib.Path(home) / "sessions").rglob("*.jsonl")):
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination / path.name)
 
 
 def _make_output_path():
@@ -1634,19 +2138,27 @@ def _terminate_process_object(process):
 def _extract_checklist_feedback(validation):
     if validation is None:
         return ""
-    stderr = validation.stderr or ""
+    diagnostic = validation.diagnostic or ""
     marker = "workflow checklist is incomplete:"
-    if marker not in stderr:
+    if marker not in diagnostic:
         return ""
-    return stderr.split(marker, 1)[1].strip()
+    return diagnostic.split(marker, 1)[1].strip()
 
 
 def _default_repair_prompt(values):
     stage = values["failure_stage"]
     parts = [
         "The previous output failed validation or review.",
-        "Do not broaden the task. Correct the previous output so it satisfies "
-        "the reported failure feedback.",
+        "Treat the reported feedback as the minimum required correction, not "
+        "necessarily an exhaustive list.",
+        "Identify the underlying failure pattern, correct every explicitly "
+        "reported instance, then inspect the current output and permitted work "
+        "artifacts for other instances of the same pattern within the original "
+        "task scope. Correct each analogous instance only after confirming that "
+        "the same cause applies to its own local evidence.",
+        "Do not expand into unrelated criteria, optional improvements, or new "
+        "task goals. Do not bulk-replace items merely because they share text, "
+        "a key, a type, or a path shape.",
         "",
         "Failure stage:",
         stage,
@@ -1657,14 +2169,8 @@ def _default_repair_prompt(values):
         "Repair attempt:",
         values["repair_attempt"],
         "",
-        "Validator return code:",
-        values["validator_returncode"],
-        "",
-        "Validator stdout:",
-        values["validator_stdout"],
-        "",
-        "Validator stderr:",
-        values["validator_stderr"],
+        "Validation diagnostic:",
+        values["validation_diagnostic"],
         "",
         "Previous final response:",
         values["previous_content"],
@@ -1673,9 +2179,9 @@ def _default_repair_prompt(values):
         parts.extend(["", "Incomplete checklist items:", values["checklist_feedback"]])
     if values["review_summary"]:
         parts.extend(["", "Review summary:", values["review_summary"]])
-    if values["review_repair_text"]:
+    if values["review_findings"]:
         parts.extend(
-            ["", "Review-requested repair changes:", values["review_repair_text"]]
+            ["", "Review findings:", values["review_findings"]]
         )
     if values["subcwd_section"]:
         parts.extend(["", values["subcwd_section"]])
@@ -1688,9 +2194,6 @@ def _default_review_prompt(values):
         "Internal review mode: codex_job_runner",
         "Review the completed job output and determine whether it follows the "
         "original request and the review context.",
-        "",
-        "Review context:",
-        values["review_context"],
         "",
         "Original request:",
         values["original_input"],
@@ -1705,70 +2208,50 @@ def _default_review_prompt(values):
     parts.extend(
         [
             "",
-            "Return JSON with fields passed (bool), repair_text (string), and summary (string).",
-            "When passed is true, repair_text may be empty.",
-            "When passed is false, repair_text must explain the changes the main job should make.",
+            "Return JSON with fields passed (bool), findings (array of strings), and summary (string).",
+            "When passed is true, findings may be empty.",
+            "When passed is false, findings must contain the changes the main job should make.",
+            "Describe the underlying failure pattern for each finding clearly enough that the "
+            "main job can check for confirmed analogous instances within the original task scope.",
         ]
     )
     return "\n".join(parts)
 
 
-def _build_review_session_developer_instructions(context):
-    return (
+def _build_review_session_developer_instructions(
+    context,
+    *,
+    subagent_context_policy=None,
+):
+    instructions = (
         "You are the reviewer in a runner-reviewer conversation session. "
         "Continue the conversation as the reviewer, follow the review context, "
         "and answer only with the reviewer's next reply.\n\n"
+        "Native collaboration tools are prohibited. Do not call Codex's "
+        "built-in spawn_agent, send_input, wait, resume_agent, or close_agent "
+        "tools. Runner-managed subagent tools served by the codex_job_runner "
+        "MCP server are not native tools, even when they share a name such as "
+        "spawn_agent; when they are available, use only the "
+        "codex_job_runner MCP tools for subagents."
+    )
+    if subagent_context_policy is not None:
+        fork_context = (
+            "true" if subagent_context_policy == "all" else "false"
+        )
+        instructions += (
+            "\n\nNative V1 subagents are ON.\n"
+            "You may use the native spawn_agent tool for independent read-only "
+            "review work. For every spawn_agent call, set "
+            f"fork_context={fork_context}. Spawned descendants inherit the "
+            "reviewer's read-only Permission Profile and must return findings "
+            "in their final response."
+        )
+    return (
+        instructions
+        + "\n\n"
         "Review context:\n"
         f"{context}"
     )
-
-
-def _build_review_session_turn_input(*, history, message):
-    if not history:
-        return message
-    lines = [
-        "Conversation history:",
-    ]
-    for role, content in history:
-        label = "Runner" if role == "runner" else "Reviewer"
-        lines.extend([f"{label}:", content, ""])
-    lines.extend(["Runner:", message])
-    return "\n".join(lines)
-
-
-def _build_review_session_prompt(
-    *,
-    context,
-    history,
-    message,
-    ignore_global_context,
-    output_schema_path,
-):
-    sections = []
-    if ignore_global_context:
-        sections.append(
-            "Global AGENTS.md and global skills should not be used for this job. "
-            "Use only the request below and explicitly attached paths as task context."
-        )
-    sections.extend(
-        [
-            "Internal review session mode: codex_job_runner",
-            "Continue the conversation as the reviewer.",
-            "",
-            "Review context:",
-            context,
-            "",
-            _build_review_session_turn_input(history=history, message=message),
-        ]
-    )
-    if output_schema_path is not None:
-        output_schema_section, _ = _resolve_inline_output_schema_section(
-            output_schema_path=output_schema_path,
-            max_file_bytes=_DEFAULT_MAX_INLINE_CONTEXT_BYTES,
-        )
-        sections.extend(["", "Output schema:", output_schema_section])
-    sections.extend(["", "Return only the reviewer's next reply."])
-    return "\n".join(sections).strip() + "\n"
 
 
 def _path_text(path):
@@ -1783,57 +2266,257 @@ def _is_relative_to(path, parent):
         return False
 
 
-def _filesystem_inline_table(cwd, read_paths, write_paths, extra_read_paths=None):
-    workspace_modes = {}
-    absolute_modes = {}
+def _filesystem_permission_map(cwd, read_paths, write_paths, extra_read_paths=None):
+    cwd = pathlib.Path(cwd).resolve()
+    cwd_modes = {}
+    outside_modes = {}
+    write_paths = list(write_paths)
     for path in read_paths:
-        workspace_modes[_workspace_relative_permission_path(path, cwd)] = "read"
+        if not _is_relative_to(path, cwd):
+            raise ValueError(f"path must be inside cwd for permission profiles: {path}")
+        if any(
+            path == write_path or _is_relative_to(path, write_path)
+            for write_path in write_paths
+        ):
+            continue
+        relative = path.relative_to(cwd).as_posix()
+        cwd_modes["." if relative == "." else relative] = "read"
     for path in write_paths:
-        workspace_modes[_workspace_relative_permission_path(path, cwd)] = "write"
+        if not _is_relative_to(path, cwd):
+            raise ValueError(f"path must be inside cwd for permission profiles: {path}")
+        relative = path.relative_to(cwd).as_posix()
+        cwd_modes["." if relative == "." else relative] = "write"
     for path in extra_read_paths or []:
         resolved = pathlib.Path(path).expanduser().resolve()
         if _is_relative_to(resolved, cwd):
-            permission_path = _workspace_relative_permission_path(resolved, cwd)
-            workspace_modes.setdefault(permission_path, "read")
-        else:
-            absolute_modes.setdefault(str(resolved), "read")
-    workspace_parts = [
-        f"{_toml_string(path)}={_toml_string(mode)}"
-        for path, mode in sorted(workspace_modes.items())
-    ]
-    absolute_parts = [
-        f"{_toml_string(path)}={_toml_string(mode)}"
-        for path, mode in sorted(absolute_modes.items())
-    ]
-    parts = [f"{_toml_string(':minimal')}={_toml_string('read')}"]
-    parts.extend(absolute_parts)
-    if workspace_parts:
-        parts.append(
-            f"{_toml_string(':workspace_roots')}="
-            "{" + ",".join(workspace_parts) + "}"
+            relative = resolved.relative_to(cwd).as_posix()
+            if relative == ".":
+                continue
+            if any(
+                mode == "write"
+                and (
+                    relative == permitted
+                    or pathlib.PurePosixPath(relative).is_relative_to(permitted)
+                )
+                for permitted, mode in cwd_modes.items()
+            ):
+                continue
+            cwd_modes.setdefault(relative, "read")
+            continue
+        outside_modes.setdefault(str(resolved), "read")
+
+    modes = {":minimal": "read"}
+    if cwd_modes:
+        modes[str(cwd)] = dict(sorted(cwd_modes.items()))
+    modes.update(dict(sorted(outside_modes.items())))
+    return modes
+
+
+def _filesystem_inline_table(cwd, read_paths, write_paths, extra_read_paths=None):
+    return _toml_inline_table(
+        _filesystem_permission_map(
+            cwd,
+            read_paths,
+            write_paths,
+            extra_read_paths=extra_read_paths,
         )
+    )
+
+
+def _toml_inline_table(mapping):
+    parts = []
+    ordered = sorted(
+        mapping.items(),
+        key=lambda item: (item[0] != ":minimal", str(item[0])),
+    )
+    for key, value in ordered:
+        rendered = (
+            _toml_inline_table(value)
+            if isinstance(value, dict)
+            else _toml_string(value)
+        )
+        parts.append(f"{_toml_string(key)}={rendered}")
     return "{" + ",".join(parts) + "}"
 
 
-def _sdk_sandbox_for_permissions(sdk, write_paths):
-    # The SDK sandbox is coarse. Path-level boundaries are carried by the
-    # wrapper-generated Permission Profile.
-    return sdk.Sandbox.workspace_write if write_paths else sdk.Sandbox.read_only
+def _permission_profile_sdk_env(env, *, existing_home=None):
+    base_env = dict(env or {})
+    if existing_home is not None:
+        isolated_home = pathlib.Path(existing_home).expanduser().resolve()
+        base_env["CODEX_HOME"] = str(isolated_home)
+        base_env["CODEX_SQLITE_HOME"] = str(isolated_home / "sqlite")
+        return base_env, isolated_home
+    source_home = pathlib.Path(
+        base_env.get("CODEX_HOME")
+        or os.environ.get("CODEX_HOME")
+        or pathlib.Path.home() / ".codex"
+    ).expanduser().resolve()
+    tmpfs_root = _SDK_SESSION_TMPFS_ROOT
+    if not tmpfs_root.is_dir() or not os.access(
+        tmpfs_root,
+        os.W_OK | os.X_OK,
+    ):
+        raise RuntimeError(
+            "SDK session isolation requires writable tmpfs at /dev/shm"
+        )
+    try:
+        isolated_home = pathlib.Path(
+            tempfile.mkdtemp(
+                prefix="codex_job_runner_home_",
+                dir=tmpfs_root,
+            )
+        ).resolve()
+    except OSError as exc:
+        raise RuntimeError(
+            f"failed to create SDK session home in /dev/shm: {exc}"
+        ) from exc
+    isolated_home.chmod(0o700)
+    sqlite_home = isolated_home / "sqlite"
+    sqlite_home.mkdir(mode=0o700)
+    source_auth = source_home / "auth.json"
+    if source_auth.is_file():
+        shutil.copy2(source_auth, isolated_home / "auth.json")
+    base_env["CODEX_HOME"] = str(isolated_home)
+    base_env["CODEX_SQLITE_HOME"] = str(sqlite_home)
+    return base_env, isolated_home
 
 
-def _workspace_relative_permission_path(path, cwd):
-    if not _is_relative_to(path, cwd):
-        raise ValueError(f"path must be inside cwd for permission profiles: {path}")
-    relative = path.relative_to(cwd)
-    if not relative.parts:
-        return "."
-    return relative.as_posix()
+def _without_legacy_sandbox_config(text):
+    lines = text.splitlines(keepends=True)
+    output = []
+    table_segments = ()
+    skip_table = False
+    skipped_value = None
+    for line in lines:
+        if skipped_value is not None:
+            skipped_value += line
+            if _toml_value_is_complete(skipped_value):
+                skipped_value = None
+            continue
+
+        table_key = _toml_table_key(line)
+        if table_key is not None:
+            table_segments = _toml_key_segments(table_key)
+            skip_table = _is_legacy_sandbox_path(
+                table_segments,
+                key_name="sandbox_workspace_write",
+            )
+            if skip_table:
+                continue
+        if skip_table:
+            continue
+
+        assignment = _toml_assignment(line)
+        if assignment is not None:
+            key, value = assignment
+            key_segments = table_segments + _toml_key_segments(key)
+            if not (
+                _is_legacy_sandbox_path(key_segments, key_name="sandbox_mode")
+                or _is_legacy_sandbox_path(
+                    key_segments,
+                    key_name="sandbox_workspace_write",
+                )
+            ):
+                output.append(line)
+                continue
+            if not _toml_value_is_complete(value):
+                skipped_value = value
+            continue
+        output.append(line)
+    return "".join(output)
+
+
+def _toml_table_key(line):
+    match = re.match(r"^\s*(\[\[?)(.*?)(\]\]?)\s*(?:#.*)?$", line.rstrip("\r\n"))
+    if match is None or len(match.group(1)) != len(match.group(3)):
+        return None
+    return match.group(2).strip()
+
+
+def _toml_assignment(line):
+    quote = None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and char == "\\":
+            escaped = True
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+            continue
+        if char == "=":
+            return line[:index].strip(), line[index + 1 :]
+        if char == "#":
+            return None
+    return None
+
+
+def _toml_key_segments(key):
+    segments = []
+    current = []
+    quote = None
+    escaped = False
+    for char in key:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if quote == '"' and char == "\\":
+            escaped = True
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            else:
+                current.append(char)
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == ".":
+            segments.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    segments.append("".join(current).strip())
+    return tuple(segment for segment in segments if segment)
+
+
+def _is_legacy_sandbox_path(segments, *, key_name):
+    return bool(
+        segments
+        and (
+            segments[0] == key_name
+            or (
+                len(segments) >= 3
+                and segments[0] == "profiles"
+                and segments[2] == key_name
+            )
+        )
+    )
+
+
+def _toml_value_is_complete(value):
+    try:
+        tomllib.loads("value = " + value)
+    except tomllib.TOMLDecodeError:
+        return False
+    return True
 
 
 def _toml_string(value):
     text = str(value)
     escaped = text.replace("\\", "\\\\").replace("\"", "\\\"")
     return f"\"{escaped}\""
+
+
+def _project_untrusted_config_override(cwd):
+    return f"projects.{_toml_string(str(cwd))}.trust_level=\"untrusted\""
 
 
 def _normalize_optional_reasoning_effort(value):

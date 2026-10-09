@@ -35,6 +35,18 @@ class CodexCancelledError(CodexExecutionError):
     """Raised when result() is called for a cancelled job."""
 
 
+class CodexNotStartedError(CodexExecutionError):
+    """Raised when result() is called for a pending job."""
+
+
+class CodexAlreadyStartedError(CodexExecutionError):
+    """Raised when a job is started more than once."""
+
+
+class CodexSessionClosedError(CodexExecutionError):
+    """Raised when an operation requires an open Codex session."""
+
+
 class CodexValidationError(CodexExecutionError):
     """Raised when a successful Codex job result fails validation."""
 
@@ -43,10 +55,7 @@ class CodexValidationError(CodexExecutionError):
         message,
         *,
         response=None,
-        validator_returncode=None,
-        validator_stdout="",
-        validator_stderr="",
-        validator_argv=None,
+        validation_diagnostic="",
         attempts=1,
         repairs=0,
         files=None,
@@ -60,19 +69,12 @@ class CodexValidationError(CodexExecutionError):
     ):
         super().__init__(
             message,
-            returncode=validator_returncode,
-            stdout=validator_stdout,
-            stderr=validator_stderr,
-            argv=validator_argv,
             files=files,
             activity_log=activity_log,
             log_path=log_path,
         )
         self.response = response
-        self.validator_returncode = validator_returncode
-        self.validator_stdout = validator_stdout
-        self.validator_stderr = validator_stderr
-        self.validator_argv = list(validator_argv or [])
+        self.validation_diagnostic = validation_diagnostic
         self.attempts = attempts
         self.repairs = repairs
         self.failure_stage = failure_stage
@@ -80,3 +82,21 @@ class CodexValidationError(CodexExecutionError):
         self.review_stdout = review_stdout
         self.review_stderr = review_stderr
         self.review_argv = list(review_argv or [])
+
+
+class CodexReviewProtocolError(CodexExecutionError):
+    """Raised when a peer-review protocol artifact or ledger is invalid."""
+
+    def __init__(self, message, *, failure_stage="review", round_index=None,
+                 diagnostic="", review_artifact_paths=(), response=None,
+                 log_path=None, **kwargs):
+        super().__init__(message, log_path=log_path, **kwargs)
+        self.failure_stage = failure_stage
+        self.round_index = round_index
+        self.diagnostic = diagnostic
+        self.review_artifact_paths = tuple(review_artifact_paths)
+        self.response = response
+
+
+class CodexReviewerDecisionValidationError(CodexReviewProtocolError):
+    """Raised when a completed reviewer turn returns an invalid decision."""

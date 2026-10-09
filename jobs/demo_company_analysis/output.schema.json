@@ -1,82 +1,158 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "primary_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim_id", "value", "unit", "scope", "as_of", "definition", "source_ids", "limitation"],
+      "properties": {
+        "claim_id": {"type": "string", "minLength": 1},
+        "value": {"type": "number"},
+        "unit": {"type": "string", "enum": ["people", "JPY", "JPY_millions"]},
+        "scope": {"type": "string", "enum": ["consolidated", "non_consolidated"]},
+        "as_of": {"type": "string", "minLength": 1},
+        "definition": {"type": "string", "minLength": 1},
+        "source_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "limitation": {"type": "string", "minLength": 1}
+      }
+    },
+    "derived_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim_id", "metric", "fiscal_year_end", "value", "unit", "scope", "as_of", "definition", "formula", "input_claim_ids", "rounding", "limitation"],
+      "properties": {
+        "claim_id": {"type": "string", "minLength": 1},
+        "metric": {"type": "string", "enum": ["consolidated_employee_count_change", "non_consolidated_employee_count_change", "non_consolidated_average_annual_salary_change", "revenue_change", "operating_income_change", "operating_margin", "revenue_per_consolidated_employee"]},
+        "fiscal_year_end": {"type": "string", "enum": ["2025-03-31", "2026-03-31"]},
+        "value": {"type": "number"},
+        "unit": {"type": "string", "enum": ["people", "JPY", "JPY_millions", "percent", "JPY_millions_per_person"]},
+        "scope": {"type": "string", "enum": ["consolidated", "non_consolidated"]},
+        "as_of": {"type": "string", "minLength": 1},
+        "definition": {"type": "string", "minLength": 1},
+        "formula": {"type": "string", "minLength": 1},
+        "input_claim_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "rounding": {"type": "string", "minLength": 1},
+        "limitation": {"type": "string", "minLength": 1}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_id", "title", "url", "document_date", "source_type", "locator"],
+      "properties": {
+        "source_id": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "url": {"type": "string", "pattern": "^https?://"},
+        "document_date": {"type": "string", "minLength": 1},
+        "source_type": {"type": "string", "enum": ["securities_report", "earnings_release", "annual_report", "official_company_page", "other_primary"]},
+        "locator": {"type": "string", "minLength": 1}
+      }
+    },
+    "discrepancy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "fiscal_year_end", "candidate_values", "adopted_claim_id", "explanation"],
+      "properties": {
+        "metric": {"type": "string", "minLength": 1},
+        "fiscal_year_end": {"type": "string", "enum": ["2025-03-31", "2026-03-31"]},
+        "candidate_values": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["value", "unit", "scope", "as_of", "definition", "source_id"],
+            "properties": {
+              "value": {"type": "number"},
+              "unit": {"type": "string", "minLength": 1},
+              "scope": {"type": "string", "minLength": 1},
+              "as_of": {"type": "string", "minLength": 1},
+              "definition": {"type": "string", "minLength": 1},
+              "source_id": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "adopted_claim_id": {"type": "string", "minLength": 1},
+        "explanation": {"type": "string", "minLength": 1}
+      }
+    }
+  },
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "company_name",
-    "summary",
-    "employee_count",
-    "salary",
-    "references"
-  ],
+  "required": ["analysis_basis", "companies", "cross_company_comparisons", "comparability_exceptions", "evidence_ledger_path"],
   "properties": {
-    "company_name": {
-      "type": "string"
-    },
-    "summary": {
-      "type": "string"
-    },
-    "employee_count": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["value", "scope", "as_of", "source_note"],
-      "properties": {
-        "value": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "scope": {
-          "type": "string",
-          "enum": ["consolidated", "non_consolidated", "unknown"]
-        },
-        "as_of": {
-          "type": "string"
-        },
-        "source_note": {
-          "type": "string"
-        }
-      }
-    },
-    "salary": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["value_jpy", "label", "as_of", "source_note"],
-      "properties": {
-        "value_jpy": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "label": {
-          "type": "string",
-          "enum": ["average_annual_salary", "starting_salary", "estimated", "unknown"]
-        },
-        "as_of": {
-          "type": "string"
-        },
-        "source_note": {
-          "type": "string"
-        }
-      }
-    },
-    "references": {
+    "analysis_basis": {"type": "string", "minLength": 1},
+    "companies": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 2,
+      "maxItems": 2,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["title", "url", "note"],
+        "required": ["company_key", "company_name", "reporting_basis", "fiscal_periods", "derived_metrics", "sources", "discrepancies"],
         "properties": {
-          "title": {
-            "type": "string"
+          "company_key": {"type": "string", "enum": ["toyota", "honda"]},
+          "company_name": {"type": "string", "minLength": 1},
+          "reporting_basis": {"type": "string", "minLength": 1},
+          "fiscal_periods": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["fiscal_year_end", "consolidated_employee_count", "non_consolidated_employee_count", "non_consolidated_average_annual_salary", "revenue", "operating_income"],
+              "properties": {
+                "fiscal_year_end": {"type": "string", "enum": ["2025-03-31", "2026-03-31"]},
+                "consolidated_employee_count": {"$ref": "#/$defs/primary_metric"},
+                "non_consolidated_employee_count": {"$ref": "#/$defs/primary_metric"},
+                "non_consolidated_average_annual_salary": {"$ref": "#/$defs/primary_metric"},
+                "revenue": {"$ref": "#/$defs/primary_metric"},
+                "operating_income": {"$ref": "#/$defs/primary_metric"}
+              }
+            }
           },
-          "url": {
-            "type": "string"
-          },
-          "note": {
-            "type": "string"
-          }
+          "derived_metrics": {"type": "array", "minItems": 9, "maxItems": 9, "items": {"$ref": "#/$defs/derived_metric"}},
+          "sources": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/source"}},
+          "discrepancies": {"type": "array", "items": {"$ref": "#/$defs/discrepancy"}}
         }
       }
-    }
+    },
+    "cross_company_comparisons": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim_id", "metric", "fiscal_year_end", "value", "unit", "formula", "input_claim_ids", "rounding", "comparability_basis", "limitation"],
+        "properties": {
+          "claim_id": {"type": "string", "minLength": 1},
+          "metric": {"type": "string", "enum": ["revenue_difference", "operating_margin_difference_percentage_points", "revenue_per_consolidated_employee_difference"]},
+          "fiscal_year_end": {"type": "string", "enum": ["2025-03-31", "2026-03-31"]},
+          "value": {"type": "number"},
+          "unit": {"type": "string", "enum": ["JPY_millions", "percentage_points", "JPY_millions_per_person"]},
+          "formula": {"type": "string", "minLength": 1},
+          "input_claim_ids": {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 1}},
+          "rounding": {"type": "string", "minLength": 1},
+          "comparability_basis": {"type": "string", "minLength": 1},
+          "limitation": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "comparability_exceptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["metric", "fiscal_year_end", "company_keys", "reason", "source_ids"],
+        "properties": {
+          "metric": {"type": "string", "minLength": 1},
+          "fiscal_year_end": {"type": "string", "enum": ["2025-03-31", "2026-03-31"]},
+          "company_keys": {"type": "array", "minItems": 1, "items": {"type": "string", "enum": ["toyota", "honda"]}},
+          "reason": {"type": "string", "minLength": 1},
+          "source_ids": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        }
+      }
+    },
+    "evidence_ledger_path": {"type": "string", "const": "${SUBCWD}/evidence_ledger.json"}
   }
 }

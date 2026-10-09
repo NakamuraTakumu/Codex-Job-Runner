@@ -1,248 +1,271 @@
 # Codex Job Runner
 
-`codex_job_runner` は、`openai-codex` SDK を使って Codex job を扱う小さな pure Python wrapper である。
-Python から Codex job を起動する必要がある skill、workflow、hook、script 作成者向けの補助 library として使う。OpenAI SDK 互換ではなく、最小の job-style API を提供する。
-
-この directory は Codex skill でもある。`SKILL.md` を entrypoint、この README を実用例、`spec.md` を利用者向け正本として扱う。機能別の詳細契約は `spec.md` 末尾の Feature Specs を参照する。
+`codex_job_runner`は、PythonからCodex jobを起動するための小さなwrapperである。
+公開APIは、最小の会話単位である`CodexSession`、未起動の処理を表す`CodexJob`、並列実行を担う`CodexWorkerPool`に分かれる。
 
 ```python
-from codex_job_runner import CodexClient, ReviewConfig
+from codex_job_runner import CodexJob, SessionConfig, WorkspaceConfig
 
-client = CodexClient(
-    cwd="/home/nakamura/recruit",
-    subcwd_root="tmp/codex-jobs",
+config = SessionConfig(
+    context=["README.md"],
+    timeout=300,
+    workspace=WorkspaceConfig(
+        cwd="/path/to/workspace",
+        read_paths=["src", "README.md"],
+        write_paths=["tmp/codex-output"],
+    ),
 )
 
-job = client.start(
-    input="このコードを説明して",
-    context=["src/main.py", "README.md"],
-    read_paths=["src", "README.md"],
-    write_paths=["tmp/codex-output"],
+job = CodexJob(
+    config=config,
+    input="このコードを説明してください。",
 )
 
-response = job.result()
+response = job.start().result()
 print(response.content)
-print(response.usage)
-print(response.argv)
-for entry in response.activity_log:
-    print(entry.phase, entry.event, entry.message)
 ```
 
-## API
+`CodexJob(...)`はprocess、thread、Function Tool bridgeを作らない`pending` instanceを返す。
+`start()`は同じinstanceを返し、`run()`は`start().result()`の同期shortcutになる。
+用途固有のfield、constructor、hookが必要な場合は`CodexJob`を継承する。
 
-- `CodexClient.start(...)`: Codex job を起動し、すぐに返る。
-- `CodexClient.run(...)`: `start(...).result(...)` の convenience method。
-- `CodexClient.start_review_session(...)`: reviewer と継続会話できる `ReviewSession` を返す。
-- `CodexClient.wait_any(jobs, timeout=None)`: 最初に完了した job を返す。なければ `None` を返す。
-- `CodexJob.done()`: subprocess が終了済みかを返す。
-- `CodexJob.result(timeout=None)`: `CodexResponse` を返す。失敗時は error を raise する。
-- `CodexJob.cancel()`: subprocess を終了する。
-- `ReviewSession.send(...)`: reviewer へ追加入力を送り、次の返答を得る。
-- `ReviewSession.close()`: reviewer session を閉じる。
-
-## Review Session
+検証や並列状態を必要としない同期処理には`CodexSession`を使う。
+初回と継続を問わず、同じ会話へ送るturnには公開`send()`を使う。
 
 ```python
-from codex_job_runner import CodexClient, ReviewConfig
+from codex_job_runner import CodexSession
 
-client = CodexClient(cwd="/home/nakamura/recruit")
-session = client.start_review_session(
-    review=ReviewConfig(
-        context=["コードレビュー担当として、指摘と補足説明を返してください。"],
-    ),
-    read_paths=["src", "README.md"],
+with CodexSession(
+    config=config,
+    input="対象を調査してください。",
+) as session:
+    response = session.run()
+    response = session.send("観点を変えて再検討してください。")
+
+continued = session.resume(input="同じ会話を続けてください。")
+branched = session.fork(input="別案を検討してください。")
+```
+
+`resume()`は同じCodex threadを継続し、`fork()`は履歴を引き継ぐ別threadを作る。
+両方とも会話stateの保存領域を共有し、SessionごとのSDK clientやTool bridgeは作り直す。
+最後の関連SessionまたはJobがGCされると、保存領域を削除する。
+
+## 公開API
+
+- `CodexSession(...)`：同じSDK threadへ同期的にturnを送る最小実行単位。
+- `CodexSession.send(...)`：同じ会話へturnを送り、必要ならschema、Pydantic model、同期validator、および同一会話でのvalidation repairを適用する。
+- `CodexSession.resume(...)`：同じ会話を新しいSessionで継続する。
+- `CodexSession.fork(...)`：履歴を分岐した新しいSessionを作る。
+- `SessionConfig(...)`：Session共通の不変な実行設定。
+- `WorkspaceConfig(...)`と`ToolConfig(...)`：workspaceとFunction Toolの設定。
+- `ValidationConfig(...)`、`FileCollectionConfig(...)`、`LoggingConfig(...)`、`SubagentConfig(...)`：Job機能の設定。
+- `CodexJob(...).start()`：pending Jobを起動する。
+- `CodexJob.run()`：単一Jobを同期実行する。
+- `CodexJob.wait_any(jobs, timeout=None)`：最初に完了したJobを返す。
+- `CodexJob.done()`、`result()`、`cancel()`：状態の観測と停止。
+- `CodexWorkerPool(...)`：構築済みpending Jobをbounded concurrencyで実行する。
+- `CodexBatch.submit(job)`、`close()`、`result()`、`cancel()`：open batchの管理。
+- `Tool(...)`：main attemptとvalidation repairから呼べる同期Python callable。
+- `ReviewConfig(...)`：automatic reviewの設定。
+
+`CodexClient`、standalone `ReviewSession`、`codex_api_wrapper` packageは削除した。
+
+## Runner管理subagent
+
+`CodexJob(subagents=...)`は、native subagentを使わず、直接の子を通常の`CodexJob`として起動する。
+機能、設定、Tool、実行フロー、権限、および制約の全体像は[`document/runner-managed-subagent-guide.md`](document/runner-managed-subagent-guide.md)を参照する。
+子は孫を生成できず、生成元の親だけが操作できる。
+子のworkspace、shell、Skill、環境変数、Tool、およびtimeoutは親の権限を超えられない。
+
+```python
+from codex_job_runner import CodexJob, SessionConfig, SubagentConfig
+
+child = SessionConfig(
+    model="gpt-5.6-luna",
+    reasoning_effort="medium",
+    allow_shell_commands=False,
 )
-
-try:
-    first = session.send("まずこの差分をレビューしてください。")
-    second = session.send("その 2 点目をもう少し具体的に説明してください。")
-finally:
-    session.close()
-
-print(first.content)
-print(second.content)
-```
-
-`ReviewSession` は reviewer の会話履歴を保持し、同じ thread を継続利用する。
-
-自動 review 用には `ReviewConfig(read_paths=[...])` を指定できる。未指定時は主 job の `read_paths` を流用し、指定時はその list を review job 専用の read permission として使う。自動 review は既定で review attempt ごとに新しい session を使う。`ReviewConfig(reuse_session=True)` の場合だけ、review fail による main repair 後の再 review で同じ reviewer session を継続利用する。reviewer input は既定で main job の初期 context 全文を含めない。必要な job だけ `ReviewConfig(include_main_context=True)` を指定する。
-
-## 入力
-
-- `context`: 初期 model context として渡す text、file、directory、path-like item。
-- `input`: 必須の run-specific task text または parameter。
-- `read_paths`: Codex が読んでよい path。
-- `write_paths`: Codex が書いてよい path。
-- `subcwd_files`: `${SUBCWD}` に事前配置する file 実体。
-- `output_schema_path`: 最終応答 shape を指定する JSON Schema file path。
-- `output_pydantic_model`: `model_json_schema()` / `model_validate_json()` を持つ Pydantic model 相当の class。`output_schema_path` の代わりに使い、wrapper はこの model から JSON Schema を生成して SDK に渡す。さらに custom `output_validator` の前に `model_validate_json()` を実行する。
-- `output_validator`: 最終応答を検証する command。
-- `collect_files`: `${SUBCWD}` 配下の通常 file を `response.files` へ回収する。
-
-`context` は、model の初期 context に入れる text、file、directory、path-like item である。固定指示、job prompt material、参照 file は別々の public API 概念にせず、同じ `context` item として扱う。通常 file は既定で上限付き inline され、path と本文が prompt に入る。
-
-string context item は、`cwd` から解決した path が存在する場合は file または directory context になる。`PathLike` item と path らしい string が存在しない場合は error になり、それ以外の string は inline text context になる。`inline_context=False` は file 本文 inline だけを抑制し、inline text context は残す。
-
-directory context は本文 inline されず、path だけ列挙される。通常 file の本文を入れたくない場合だけ `inline_context=False` を明示する。
-
-`context` ordering matters。OpenAI prompt caching は prefix-based automatic caching なので、wrapper は固定または安定した共通 item を先に、volatile または run-specific な item を後に並べられるようにする。item-level の cache flag や cache metadata は持たない。
-
-`input` は run-specific な依頼や parameter であり、prompt 構築時は安定した `context` の後に置かれる。file 内容を `context` に入れる場合、同じ内容を `input` にも貼らない。
-
-`read_paths` は、context 以外に Codex が必要時に読んでよい filesystem 範囲である。context に入れた file だけを読ませる場合、通常は `read_paths` を別途広げる必要はない。
-
-`write_paths` または `read_paths` に `"${SUBCWD}/..."` を指定するか、`subcwd_files` を使うと、job ごとの一時 directory が `subcwd_root` 配下に作られる。`subcwd_root` を省略した場合は `cwd` を使う。`collect_files=True` の場合、job 終了後に通常 file を memory 上へ回収してから一時 directory を削除する。
-
-`subcwd_files` は staging だけを行い、権限は付与しない。staged file を読むなら `read_paths=["${SUBCWD}/..."]`、編集または生成するなら `write_paths=["${SUBCWD}/..."]` を明示する。bare な `"${SUBCWD}"` は受け付けない。
-
-```python
-response = client.run(
-    input="inputs/neighborhood_tree.json を直接編集して完成させてください",
-    subcwd_files={
-        "inputs/neighborhood_tree.json": {
-            "text": '{"status": "draft"}\\n',
-        }
-    },
-    read_paths=["${SUBCWD}/inputs/neighborhood_tree.json"],
-    write_paths=["${SUBCWD}/inputs/neighborhood_tree.json"],
-    collect_files=True,
-)
-
-print(response.files["inputs/neighborhood_tree.json"].text)
-```
-
-```python
-response = client.run(
-    input="report.md を作成してください",
-    write_paths=["${SUBCWD}/report.md"],
-    collect_files=True,
-)
-
-print(response.files["report.md"].text)
-```
-
-## 実行設定
-
-- `model`
-- `reasoning_effort`
-- `cwd`
-- `subcwd_root`
-- `timeout`
-- `ephemeral`
-- `ignore_global_context`
-- `allowed_skills`
-- `allow_shell_commands`
-- `env`
-- `log_dir`
-
-`ignore_global_context=True` は次を追加する。
-
-- `-c 'project_doc_max_bytes=0'`
-- `-c 'features.hooks=false'`
-- `allowed_skills` が未指定の場合は `-c 'skills.include_instructions=false'`
-- prompt 上で global `AGENTS.md` と skills に依存しないよう指示する文面
-
-runner は `ignore_global_context` に関係なく、非対話 job として次を常時 off にする。
-
-- approval requests: SDK `ApprovalMode.deny_all`
-- MCP servers: `-c 'mcp_servers={}'`
-- known apps / MCP apps: `-c 'features.apps=false'`, `-c 'features.enable_mcp_apps=false'`
-- multi-agent / collab: `-c 'features.multi_agent=false'`, `-c 'features.multi_agent_v2=false'`, `-c 'features.collaboration_modes=false'`
-- memory: `-c 'features.memories=false'`, `-c 'memories.generate_memories=false'`, `-c 'memories.use_memories=false'`
-
-`connectors={}` は現 installed Codex CLI の strict config で unknown field になるため渡さない。wrapper が抑制するのは known apps / MCP apps と MCP server config の経路であり、将来の未知 connector 設定まで完全に無効化する保証ではない。
-
-`CODEX_HOME` は変更しない。global `AGENTS.md` が隠れることも保証しない。
-
-`allowed_skills` は v1 では `None` または `[]` だけを受け取る。`allowed_skills=[]` は automatic skills instructions block を隠す。非空 list による skill allow-list は未対応で、実行前に `ValueError` にする。
-
-wrapper の既定値は `model="gpt-5.4-mini"` と `reasoning_effort="medium"` である。明示的に別値へ変えたい場合だけ指定する。Codex CLI または user config の既定値へ委譲したい場合は、`CodexClient(model=None, reasoning_effort=None, ...)` のように client default を `None` にする。
-
-`reasoning_effort` は SDK turn の `effort` に渡す。thinking effort を job ごとに変えたい場合に使う。wrapper 既定値は `medium` であり、client または per-call で別値を指定した場合だけ上書きする。
-
-`subcwd_root` は `${SUBCWD}` を使う job の一時 directory の親ディレクトリを指定する client default である。`cwd` 相対または absolute path を受け付けるが、正規化後に `cwd` 配下でなければならない。`${SUBCWD}` token は受け付けない。未指定時は `cwd` を使う。
-
-`allow_shell_commands=True` が既定値である。shell command は Permission Profile の filesystem sandbox 内で実行され、`read_paths` / `write_paths` の境界に従う。
-
-`allow_shell_commands=False` を明示した場合、wrapper は `-c 'features.shell_tool=false'` と `-c 'allow_login_shell=false'` を渡し、file edit 以外の shell command 実行を基本的に使わせない。
-
-command prefix ごとの allowlist / denylist は v1 API では扱わない。必要な場合は、Codex CLI の rules 設定を wrapper の外側で管理する。
-
-`read_paths` は filesystem permission であり、file 内容を prompt に入れる機能ではない。初期 context として内容を渡す場合は `context` を使う。
-
-`subcwd_files` は `${SUBCWD}` workspace に初期 file を staged する per-call API である。key は `${SUBCWD}` 内の相対 path、value は `{"text": "..."}` または `{"bytes": b"..."}` とする。小さい UTF-8 text でも wrapper は自動 inline せず、prompt には staged file の path 一覧だけを出す。staged file を使う path は `read_paths` または `write_paths` で別途明示する。
-
-`output_schema_path` は SDK turn の `output_schema` に渡す。さらに schema file の本文を `Output schema` section として初期 context に入れる。schema は UTF-8 text の通常 file とし、inline context と同じ 1 file byte 上限に従う。wrapper は schema validation を自前実装しない。
-
-`output_pydantic_model` を指定した場合、wrapper は `model_json_schema()` から一時 JSON Schema file を生成して SDK turn に渡す。prompt context には model source context を入れる。さらに final response に対して `model_validate_json()` を走らせ、失敗した場合は `output_validator` より前に validation failure として扱う。`output_schema_path` と `output_pydantic_model` の同時指定はできない。
-
-`output_validator` は `response.content` を stdin に受け取る command として実行される。引数が必要な場合は shell 文字列ではなく argv list で渡す。
-
-```python
-response = client.run(
-    input="結果を JSON で返してください",
-    output_schema_path="schemas/result.schema.json",
-    output_validator=["python3", "scripts/validate_result.py"],
-    repair_validation_failures=True,
-    max_repairs=5,
-    review=ReviewConfig(
-        context=["元の依頼と最終成果物が一致しているか確認し、問題があれば修正指示を返してください。"],
+job = CodexJob(
+    config=SessionConfig(model="gpt-5.6-luna"),
+    input="調査してください。",
+    subagents=SubagentConfig(
+        session=child,
+        allowed_models={"gpt-5.6-luna": ("low", "medium", "high")},
+        max_concurrent=2,
     ),
 )
 ```
 
-validator が non-zero で終了した場合は `CodexValidationError` になる。`repair_validation_failures=True` の場合、wrapper は同じ main SDK thread、同じ model、同じ `${SUBCWD}` で repair attempt を行い、成功した最終応答だけを返す。さらに `review=ReviewConfig(...)` を渡すと、初回 main context に review notice を追加し、validator 成功後に review session を 1 turn 実行する。review notice は repair turn には追加しない。reviewer の file access は `ReviewConfig.read_paths` があればそれを使い、なければ主 job の `read_paths` を流用する。review fail 時も repair request に修正指示を流し込む。`ReviewConfig(reuse_session=True)` の場合、review fail 後の再 review は同じ reviewer session に続けて送る。`ReviewConfig(include_main_context=True)` の場合だけ、reviewer input に main job context 全文を含める。詳細契約は `validation-repair-spec.md` と `review-spec.md` を参照する。
+親には`spawn_agent`、`send_message`、`followup_task`、`interrupt_agent`、`list_agents`、`wait_agent`の六つのToolが追加される。
+`spawn_agent`は親inputと履歴を継承せず、`message`だけを子inputにする。
+子には`ask_parent(message)`だけが追加され、親の回答を待って同じturnを再開できる。
+`wait_agent`は子の質問、終端、またはtimeoutまで待ち、子Jobのfile logに前回取得後追加された行をそのまま返す。
+子Jobのactivity logは`[Subagent /root/<task_name>]`をactor prefixに使い、親やReviewerの`[Main Attempt]`と区別する。
+子ごとの結果は`job.subagent_results`、子だけの推定費用は`job.subagent_estimated_cost_usd`で参照する。
+親、reviewer、および両者のRunner管理子を含む再帰合計は`job.total_usage`と`job.total_estimated_cost_usd`、モデル別内訳は`job.total_usage_by_model`と`job.total_estimated_cost_usd_by_model`で参照する。
+`job.total_cost_complete`と`job.total_usage_incomplete_reasons`は、再帰合計の完全性と欠落理由を公開する。
+費用が欠落した場合、推定費用は`None`となり、`subagent_cost_complete=False`で欠落を示すが、追加turnは拒否しない。
+子の累積数、全子の総turn数、子ごとのturn数には上限を設けず、`max_concurrent`だけが同時実行数を制限する。
+automatic Reviewerへは`ReviewConfig.subagents`で独立した設定を指定し、main設定は継承しない。
 
-`CodexResponse.usage` は `dict[str, int] | None` で、SDK が返した `turn.completed.usage` を保持する。repair が発生した job では attempt ごとに合算した値を返す。
+## Mainとreviewerの一往復
 
-`CodexResponse.pricing` と `CodexResponse.estimated_cost_usd` は wrapper 内蔵の価格表に基づく概算である。実請求額の保証ではない。価格表にない model では `None` になる。
+`ReviewConfig.enable_peer_exchange=True`を指定すると、main attemptとreviewerへ内部Tool `ask_peer(message)`を追加する。
+このToolは相手の直近の完了済み会話から、write pathを設定しない一時的なforkを作り、質問文を一つ送り、回答文だけを返す。
+元のmainとreviewerの履歴は変更しない。
+answer forkのshell可否はfork元となる相手の`SessionConfig.allow_shell_commands`を継承する。
+reviewerからmainへ質問する場合はmain設定、mainからreviewerへ質問する場合は`ReviewConfig.session`設定を使う。
+write path、一般Tool、subagent、hook、Skillはshell可否にかかわらずanswer forkへ渡さない。
+ただし、shellを有効にした実行環境では、一時的なsandbox内への書き込みまで拒否されるとは限らない。
+`write_paths=()`が保証するのは、answer forkへ永続的な書き込み先を設定しないことである。
 
-`CodexResponse.argv` は最終的に成功した main attempt の argv を保持する。`CodexResponse.activity_log` は wrapper が積んだ phase log で、main attempt / stream / validator / review / repair / file collection / cleanup / timeout / cancel の start/end/error/detail を順に読める。repair attempt は `phase="main_attempt"` と `repair_index > 0` で表し、repair 中の stream event にも `attempt` と `repair_index` が入る。review input と repair prompt は全文ではなく、byte size、sha256、preview の要約として残す。各 entry には `phase`、`event`、`message`、必要に応じて `attempt`、`repair_index`、`argv`、`returncode`、`stdout`、`stderr` が入る。`CodexResponse.log_path` はこの activity log を書いた file path で、per-call `log_path` を指定した場合はその path を使う。
+```python
+from codex_job_runner import ReviewConfig
 
-package install なしで script から使う場合は、次を設定する。
-
-```bash
-PYTHONPATH="$CODEX_HOME/skills/codex-job-runner"
+job = CodexJob(
+    config=config,
+    input="設計案を作成してください。",
+    review=ReviewConfig(
+        context="要件漏れと安全性を確認してください。",
+        enable_peer_exchange=True,
+        artifact_paths=["report.md"],
+        reuse_session=True,
+    ),
+)
+response = job.run()
 ```
 
-## 権限
+`context`はreviewerへ与える評価基準・指示であり、会話履歴ではない。
+peer reviewは初回から全roundで同じreviewer会話を継続するため、`reuse_session=True`が必須である。`artifact_paths`には査読対象のworkspace内text fileまたはdirectoryを指定する。
+`False`でも、mainは直近の完了済みreviewer会話へ質問できる。
+reviewerの判定がJSONまたはprotocol要件を満たさない場合は、同じreviewer会話へ診断を返して再生成する。
+artifact読取失敗や実行errorは再生成せず、Jobを失敗させる。
+機能を無効にした場合は内部Toolも追加せず、通常のautomatic reviewの動作を維持する。
 
-wrapper は `-c` override で job ごとの Permission Profile を組み立てる。
+## 具体Job
 
-```bash
--c 'default_permissions="<job-profile>"'
--c 'permissions.<job-profile>.filesystem={":minimal"="read",":workspace_roots"={...}}'
+```python
+class AnalysisJob(CodexJob):
+    def __init__(self, *, config: SessionConfig, company_name: str):
+        self.company_name = company_name
+        self.progress = 0
+        super().__init__(
+            config=config,
+            input=f"{company_name}を分析してください。",
+        )
 ```
 
-`read_paths` は `read`、`write_paths` は `write` になる。wrapper は `danger-full-access` を公開しない。
+hookは引数なしのinstance methodとして上書きする。
 
-`write_paths` は同じ path の read access も含む。`${SUBCWD}/...` もこの扱いに従う。
-
-`subcwd_files` がある job でも、wrapper は `${SUBCWD}` 権限を自動付与しない。staged file や生成 file は、必ず `${SUBCWD}/...` の read/write path で個別または directory 単位に明示する。実運用では `ignore_global_context=True` を推奨し、広い `read_paths` / `write_paths` は避ける。最も安全なのは job 専用 `cwd` を使う構成である。
-
-`allow_shell_commands=True` の場合、wrapper は sandbox 内の command runner が起動できるように、検出できた Codex runtime directory を内部 read-only path として Permission Profile に追加する。検出できない環境では追加しない。これは `context` やユーザー指定の `read_paths` とは別扱いであり、作業対象 data の読み取り許可を広げるものではない。
-
-v1 の `read_paths` / `write_paths` は `cwd` 配下だけを受け取る。wrapper は path を `cwd` からの相対 path に変換し、Permission Profile の `:workspace_roots` に渡す。`cwd` の外側の path は実行前に `ValueError` になる。
-
-旧 `--sandbox` / `sandbox_mode` は wrapper の主経路ではない。Codex CLI は Permission Profile と旧 sandbox 設定を併用しないため、strict な path permission が必要な job では `ignore_global_context=True` を併用して user config の旧 sandbox 設定の影響を減らす。
-
-Permission Profile は Codex CLI の sandbox runtime が機能していることを前提にする。Linux / WSL2 では sandbox runtime が失敗すると、許可した `write_paths` への書き込みも失敗しうる。この wrapper はその状態を bypass せず、`stderr` と error として呼び出し側へ返す。
-
-## エラー
-
-- `CodexExecutionError`: Codex job attempt が non-zero で終了した、または review job の実行・出力 parse に失敗した。
-- `CodexTimeoutError`: `result(timeout=...)` が timeout し、process が停止された。
-- `CodexCancelledError`: `cancel()` 後に `result()` が呼ばれた。
-- `CodexValidationError`: Codex job は成功したが、`output_validator` または review が成果物を不合格にした。
-
-error は `returncode`、`stdout`、`stderr`、`argv` を持つ。さらに `activity_log` と `log_path` で wrapper 側 phase log を読める。`CodexValidationError` は validator / review 専用 field も保持する。review output parse failure や review subprocess failure は `CodexExecutionError` だが、`codex job communication failed: ...` に潰れず、review 側の stdout / stderr / argv を追える。
-
-## テスト
-
-実行:
-
-```bash
-python -m unittest discover -s "$CODEX_HOME/skills/codex-job-runner/tests"
+```python
+class ObservableJob(AnalysisJob):
+    def before_main_attempt(self):
+        self.progress += 1
 ```
 
-unit test は fake SDK を使うため、network access や実際の Codex session は不要である。
+## Jobごとのvalidator、Tool、hook
+
+`output_validators`、`tools`、`hooks.<phase>`は、`pending`のJobへ追加できるlist互換fieldである。
+`start()`またはPool dispatch後はsnapshot化され、変更できない。
+
+```python
+from codex_job_runner import Tool
+
+def echo(value: str) -> str:
+    return value
+
+job.output_validators.append(
+    lambda response: None if response.content.strip() else (_ for _ in ()).throw(ValueError("empty output"))
+)
+job.tools.append(
+    Tool(
+        echo,
+        "Return the supplied value.",
+        args={"value": "A value."},
+        returns="The supplied value.",
+    )
+)
+job.hooks.after_cleanup.append(lambda: print("cleaned up"))
+```
+
+Pydantic、`validate_output()` override、`ToolConfig.tools`、既存hook method overrideも同じfieldへ自己登録される。
+validatorとhookは追加順に実行される。
+
+## 出力検証とrepair
+
+`ValidationConfig`はrepairの挙動だけを設定する。外部validator command、argv、stdin、timeoutは公開APIにない。
+出力内容の検証は具体`CodexJob`の同期method `validate_output(response: CodexResponse) -> None`へ置く。
+
+```python
+from codex_job_runner import CodexJob, CodexResponse, ValidationConfig
+
+
+class JsonJob(CodexJob):
+    def __init__(self, *, config):
+        super().__init__(
+            config=config,
+            input="JSONを返してください。",
+            validation=ValidationConfig(repair=True),
+        )
+
+    def validate_output(self, response: CodexResponse) -> None:
+        if not response.content.startswith("{"):
+            raise ValueError("output must be a JSON object")
+```
+
+`ValueError`はrepair可能な診断として扱われ、`repair=True`かつ回数上限内ならrepair turnを行う。最終的な`CodexValidationError`は診断を`validation_diagnostic`に保持する。
+`ValueError`以外はJobの実行失敗でありrepairしない。
+`output_pydantic_model`を指定した場合はPydantic validatorが先に実行され、失敗時は後続validatorを呼ばない。
+`output_schema_path`はSDKへ渡すschemaであり、method validationやPydanticの代替ではない。
+
+## Worker Pool
+
+```python
+from codex_job_runner import CodexWorkerPool
+
+jobs = [
+    AnalysisJob(config=config, company_name="A"),
+    AnalysisJob(config=config, company_name="B"),
+]
+
+pool = CodexWorkerPool(max_workers=4)
+result = pool.start_many(jobs).result()
+```
+
+PoolはJobを生成せず、pending Jobをatomicにclaimする。
+同じTool instance列、`ToolConfig.max_concurrent_calls`、`ToolConfig.timeout`を持つJobは、batch内で一つのbridgeを共有する。
+単発JobのbridgeはJob専有であり、終了時に自動で閉じる。
+Batch結果は、全Jobの再帰合計を`usage`と`estimated_cost_usd`、モデル別内訳を`usage_by_model`と`estimated_cost_usd_by_model`で公開する。
+成功・失敗別のモデル内訳は`successful_usage_by_model`と`failed_usage_by_model`で参照する。
+`usage_complete`と`usage_incomplete_reasons`は、失敗Jobを含む全Jobのusage完全性を表す。
+
+open batchでは、構築済みJobを途中追加できる。
+
+```python
+batch = pool.start_batch()
+batch.submit(AnalysisJob(config=config, company_name="A"))
+batch.submit(AnalysisJob(config=config, company_name="B"))
+batch.close()
+result = batch.result()
+```
+
+## 仕様
+
+公開API、状態遷移、設定配置、資源所有の正本は
+[`document/job-centered-public-api-spec.md`](document/job-centered-public-api-spec.md)である。
+旧`CodexClient`からの変更手順は
+[`document/job-centered-api-migration-guide.md`](document/job-centered-api-migration-guide.md)にまとめている。
+sandbox、SUBCWD、validation repair、review、loggingを含む現行契約も同じ公開API仕様を正本とする。
+# Native subagent usage telemetry
+
+`CodexResponse.native_usage` contains one `CodexNativeUsage` record for each
+observed app-server `rawResponse/completed` notification, including native
+subagent turns. A record is `exact=True` only when both server usage and model
+attribution are available. Model attribution prefers a runtime reroute or
+thread setting; when neither is emitted, it may be the native collab request
+model or configured `default_subagent_model`, rather than a billing-confirmed
+runtime model. `estimated_cost_usd` uses
+these records exactly once, per attributed model, when every observed record
+is exact; then `usage_cost_source="app_server_exact"`. Otherwise it retains
+the parent-stream estimate and reports `usage_cost_source="parent_stream_fallback"`.
+Neither value is a billing invoice.

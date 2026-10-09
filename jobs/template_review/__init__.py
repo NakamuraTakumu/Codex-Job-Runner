@@ -1,5 +1,5 @@
 """Template wrapper job."""
 
-from .client import TemplateReviewClient
+from .client import TemplateReviewJob
 
-__all__ = ["TemplateReviewClient"]
+__all__ = ["TemplateReviewJob"]

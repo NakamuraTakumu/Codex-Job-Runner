@@ -2,7 +2,7 @@
 
 `jobs/` には、`codex_job_runner` で起動する再利用可能な wrapper job を置く。
 
-各 job は正式な agent や subagent ではなく、`CodexClient` subclass、prompt、schema をまとめた job template である。
+各jobは正式なagentやsubagentではなく、`CodexJob` subclass、prompt、schemaをまとめたjob templateである。
 
 標準構成:
 
@@ -15,6 +15,6 @@ template_review/
   output.schema.json
 ```
 
-`client.py` では job 専用の `CodexClient` subclass を定義する。subclass の `start(...)` は job 固有の入力を受け取り、最後に `super().start(...)` を呼ぶ。
+`client.py`ではjob専用の`CodexJob` subclassを定義する。subclassのconstructorはjob固有の入力を受け取り、最後に`super().__init__(...)`を呼ぶ。
 
-`run(...)` は `CodexClient.run(...)` を継承して使う。`run(...)` のために job 側で別関数を増やさない。
+`start()`と`run()`は`CodexJob`から継承する。
