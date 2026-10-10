@@ -50,6 +50,11 @@ class _ConversationStoreCleanup:
         with self._lock:
             return self._home
 
+    @property
+    def cleaned(self):
+        with self._lock:
+            return self._cleaned
+
     def __call__(self):
         with self._lock:
             if self._cleaned:
@@ -74,6 +79,10 @@ class _ConversationStore:
     @property
     def home(self):
         return self._cleanup.home
+
+    @property
+    def deleted(self):
+        return self._cleanup.cleaned
 
     def attach_home(self, home):
         self._cleanup.attach(home)
@@ -455,6 +464,10 @@ class CodexSession:
             raise CodexNotStartedError(
                 "codex session conversation has not started"
             )
+        if state is not None and state.store.deleted:
+            raise CodexSessionClosedError(
+                "codex conversation store was deleted when its owning job finished"
+            )
         return CodexSession(
             config=self.config if config is None else config,
             input=input,
@@ -479,6 +492,10 @@ class CodexSession:
         if state is None or state.thread_id is None:
             raise CodexNotStartedError(
                 "codex session conversation has not started"
+            )
+        if state is not None and state.store.deleted:
+            raise CodexSessionClosedError(
+                "codex conversation store was deleted when its owning job finished"
             )
         with state.turn_lock:
             forked_state = state.fork()

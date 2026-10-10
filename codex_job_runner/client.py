@@ -823,6 +823,7 @@ def _start_runtime(
                 _cleanup_tree(home)
         return cleanup
 
+    owns_main_store = _conversation_state is None
     main_conversation_state = _conversation_state or _ConversationState(
         _ConversationStore(archiving_cleanup("main"))
     )
@@ -1080,10 +1081,7 @@ def _start_runtime(
             except Exception:
                 pass
         if reviewer_source is not None:
-            try:
-                reviewer_source.close()
-            except Exception:
-                pass
+            _close_session_and_delete_store(reviewer_source)
         if bridge is not None:
             bridge.close()
 
@@ -1255,6 +1253,12 @@ def _start_runtime(
         if job is not None:
             job._conversation_state = main_sdk_session.conversation_state
         main_sdk_session.close()
+        # A job deletes only a store it created; injected states (resume,
+        # fork, subagent follow-up) belong to whoever supplied them.
+        if owns_main_store and not getattr(
+            job, "_retain_conversation_store", False
+        ):
+            main_conversation_state.store.delete()
         if job is not None:
             _discard_runtime_job(runtime, job)
 
@@ -1452,7 +1456,12 @@ def _start_runtime(
         if session is None:
             return
         review_session_cache["session"] = None
-        session.close()
+        with peer_exchange_lock:
+            is_peer_source = peer_exchange_state["reviewer_source"] is session
+        if is_peer_source:
+            session.close()  # peer exchange still forks it; released with it
+        else:
+            _close_session_and_delete_store(session)
 
     def run_review(
         *,
@@ -1678,10 +1687,18 @@ def _start_runtime(
                         previous_source is not None
                         and previous_source is not review_session
                     ):
-                        previous_source.close()
+                        _close_session_and_delete_store(previous_source)
             finally:
                 if not review_config.reuse_session:
-                    review_session.close()
+                    with peer_exchange_lock:
+                        is_peer_source = (
+                            peer_exchange_state["reviewer_source"]
+                            is review_session
+                        )
+                    if is_peer_source:
+                        review_session.close()
+                    else:
+                        _close_session_and_delete_store(review_session)
             content = review_response.content
             if protocol is not None:
                 passed = not parsed["new_findings"] and not any(
@@ -1984,6 +2001,17 @@ def _review_options(runtime, *, review_config, options):
         default_subagent_model=None,
         default_subagent_reasoning_effort=None,
     )
+
+def _close_session_and_delete_store(session):
+    """Close a review session this runtime created and delete its store."""
+    try:
+        session.close()
+    except Exception:
+        pass
+    state = getattr(session, "_conversation_state", None)
+    if state is not None:
+        state.store.delete()
+
 
 def _create_review_session(
     runtime,

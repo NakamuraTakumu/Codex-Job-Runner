@@ -2316,6 +2316,7 @@ class CodexJob(CodexSession):
         self._invoke_hook("cleanup", "before", raise_errors=False)
         self._cleanup_output_files()
         self._cleanup_temp_output_schema()
+        self._close_subagent_manager()
         self._cleanup_review_session()
         self._cleanup_main_session()
         self._cleanup_subcwd()
@@ -2327,6 +2328,20 @@ class CodexJob(CodexSession):
                 self._finish_callback()
             except Exception:
                 pass
+
+    def _close_subagent_manager(self):
+        manager = getattr(self, "_subagent_manager", None)
+        if manager is None:
+            return
+        try:
+            manager.close()
+        except Exception as exc:
+            self._log_activity(
+                "cleanup",
+                "error",
+                f"subagent cleanup failed: {exc}",
+                stderr=str(exc),
+            )
 
     def _cleanup_review_session(self):
         if self._review_session_cleanup is None:

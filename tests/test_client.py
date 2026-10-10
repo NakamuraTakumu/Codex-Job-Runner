@@ -27,6 +27,8 @@ import codex_job_runner.job as public_job_module  # noqa: E402
 from codex_job_runner import (  # noqa: E402
     CodexCancelledError,
     CodexResponse,
+    CodexSessionClosedError,
+    CodexWorkerPool,
     CodexExecutionError,
     CodexTimeoutError,
     CodexValidationError,
@@ -441,19 +443,105 @@ class CodexClientTests(unittest.TestCase):
         self.assertNotIn("ECHO_PROMPT after fork", branch_thread.prompts)
         self.assertIn("ECHO_PROMPT branch", branch_thread.prompts)
 
-    def test_completed_public_job_can_resume_as_a_session(self):
+    def test_finished_job_deletes_its_store_so_resume_and_fork_are_refused(self):
         config = SessionConfig(
             workspace=WorkspaceConfig(cwd=self.project),
         )
         job = CodexJob(config=config, input="ECHO_PROMPT job")
 
         response = job.run()
-        continued = job.resume(input="ECHO_PROMPT continued")
-        continued_response = continued.run()
 
         self.assertIn("ECHO_PROMPT job", response.content)
-        self.assertIn("ECHO_PROMPT continued", continued_response.content)
-        self.assertEqual(len(self.thread_start_calls), 1)
+        with self.assertRaises(CodexSessionClosedError):
+            job.resume(input="ECHO_PROMPT continued")
+        with self.assertRaises(CodexSessionClosedError):
+            job.fork(input="ECHO_PROMPT branched")
+
+    def _assert_no_new_homes(self, before):
+        self.assertEqual(set(self._sdk_home_dirs()), before)
+
+    def test_finished_job_removes_home_while_job_is_still_referenced(self):
+        before = set(self._sdk_home_dirs())
+        gc.disable()
+        try:
+            job = CodexJob(
+                config=SessionConfig(workspace=WorkspaceConfig(cwd=self.project)),
+                input="ECHO_PROMPT job",
+                review=ReviewConfig(context="REVIEW_SHOULD_PASS"),
+            )
+            response = job.run()
+            self._assert_no_new_homes(before)
+        finally:
+            gc.enable()
+        self.assertTrue(response.content)
+
+    def test_job_removes_homes_with_peer_exchange_and_reused_reviewer(self):
+        before = set(self._sdk_home_dirs())
+        job = CodexJob(
+            config=SessionConfig(workspace=WorkspaceConfig(cwd=self.project)),
+            input="REVIEW_TRIGGER_REPAIR",
+            review=ReviewConfig(
+                context="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE",
+                enable_peer_exchange=True,
+                reuse_session=True,
+            ),
+            validation=ValidationConfig(repair=True),
+        )
+        gc.disable()
+        try:
+            job.run()
+            self._assert_no_new_homes(before)
+        finally:
+            gc.enable()
+
+    def test_timed_out_and_cancelled_jobs_remove_home_while_referenced(self):
+        before = set(self._sdk_home_dirs())
+        config = SessionConfig(workspace=WorkspaceConfig(cwd=self.project))
+        timed_out = CodexJob(config=config, input="sleep").start()
+        with self.assertRaises(CodexTimeoutError):
+            timed_out.result(timeout=0.1)
+        timed_out._thread.join(timeout=2)
+        cancelled = CodexJob(config=config, input="sleep").start()
+        time.sleep(0.1)
+        cancelled.cancel()
+        with self.assertRaises(CodexCancelledError):
+            cancelled.result(timeout=2)
+        cancelled._thread.join(timeout=2)
+        self._assert_no_new_homes(before)
+
+    def test_pool_batch_removes_every_home_while_results_are_referenced(self):
+        before = set(self._sdk_home_dirs())
+        config = SessionConfig(workspace=WorkspaceConfig(cwd=self.project))
+        jobs = [
+            CodexJob(
+                config=config,
+                input=f"ECHO_PROMPT job {index}",
+                review=ReviewConfig(context="REVIEW_SHOULD_PASS"),
+            )
+            for index in range(4)
+        ]
+        gc.disable()
+        try:
+            result = CodexWorkerPool(max_workers=2, warmup_jobs=0).start_many(
+                jobs
+            ).result(timeout=10)
+            self._assert_no_new_homes(before)
+        finally:
+            gc.enable()
+        self.assertEqual(len(result.responses), 4)
+
+    def test_session_resume_keeps_store_until_explicitly_deleted(self):
+        config = SessionConfig(workspace=WorkspaceConfig(cwd=self.project))
+        source = CodexSession(config=config, input="ECHO_PROMPT first")
+        source.run()
+        source.close()
+        gc.disable()
+        try:
+            source.resume(input="ECHO_PROMPT again").run()
+            self.assertTrue(self._sdk_home_dirs())
+            source._conversation_state.store.delete()
+        finally:
+            gc.enable()
 
     def test_subagent_enabled_job_removes_isolated_home_after_completion(self):
         before = set(self._sdk_home_dirs())

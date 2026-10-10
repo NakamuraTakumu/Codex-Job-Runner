@@ -532,6 +532,22 @@ class _DirectChildManager:
             )
 
     def close(self, *, timeout: float | None = None) -> None:
+        """Stop all children, then delete the conversation stores they own."""
+        try:
+            self._close(timeout=timeout)
+        finally:
+            with self._condition:
+                states = [
+                    entry.conversation_state
+                    for entry in self._entries.values()
+                    if entry.conversation_state is not None
+                ]
+            for state in states:
+                store = getattr(state, "store", None)
+                if store is not None:
+                    store.delete()
+
+    def _close(self, *, timeout: float | None = None) -> None:
         deadline = time.monotonic() + _close_timeout_seconds(timeout)
         with self._condition:
             if self._closing:
@@ -608,6 +624,8 @@ class _DirectChildManager:
             _activity_actor=f"Subagent {entry.target}",
             _rollout_dir=None if rollout_root is None else rollout_root / entry.task_name,
         )
+        # The manager owns the child's store so followup_task can continue it.
+        job._retain_conversation_store = True
         with self._condition:
             self._ensure_open()
             entry.job = job

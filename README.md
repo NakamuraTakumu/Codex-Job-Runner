@@ -48,7 +48,9 @@ branched = session.fork(input="別案を検討してください。")
 
 `resume()`は同じCodex threadを継続し、`fork()`は履歴を引き継ぐ別threadを作る。
 両方とも会話stateの保存領域を共有し、SessionごとのSDK clientやTool bridgeは作り直す。
-最後の関連SessionまたはJobがGCされると、保存領域を削除する。
+`CodexSession`の保存領域は、最後の関連SessionがGCされると削除する。
+`CodexJob`が自分で作った保存領域（reviewerとRunner管理子を含む）は、Jobが終端状態（成功、失敗、cancel、timeout）に達した時点で、rolloutをarchiveしてから削除する。
+そのため終了済みJobへの`resume()`と`fork()`は`CodexSessionClosedError`になる。
 
 ## 公開API
 
