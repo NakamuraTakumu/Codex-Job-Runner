@@ -126,7 +126,7 @@ dependency、priority、retry、意味的な結果統合は扱わない。
 - 子のworkspace、shell、Skill、環境変数、Tool、およびtimeoutは親の権限を超えてはならない。
 - `SubagentConfig`は`max_concurrent`で同時実行数だけを制限する。子の累積数、全子の総turn数、子ごとのturn数は制限しない。費用は集計するが、費用額または費用情報の欠落を起動制限には使わない。
 - automatic Reviewerのsubagentは`ReviewConfig.subagents`へ独立指定し、mainの設定を継承しない。
-- Jobの`total_usage`、`total_usage_by_model`、`total_estimated_cost_usd`、`total_estimated_cost_usd_by_model`は、Main、Reviewer、および両者のRunner管理子を再帰集計する。
+- Jobの`total_usage`、`total_usage_by_model`、`total_estimated_cost_usd`、`total_estimated_cost_usd_by_model`は、Main、回答fork、Reviewer、およびRunner管理子を再帰集計する。
 - Batchのusageと費用は成功・失敗Jobを含む再帰合計とし、モデル別内訳も公開する。`usage_complete`は全構成要素のusageを確認できた場合だけ`True`にする。
 - cwd、path、SUBCWD、inline contextは`WorkspaceConfig`へ置く。
 - filesystemのread/writeには、`SessionConfig.allow_shell_commands=True`（shell設定をon）にする必要がある。`read_paths` / `write_paths`は対象pathの許可範囲を定める設定であり、これらを指定しても`allow_shell_commands=False`ならfilesystemのread/writeは有効にならない。
@@ -142,10 +142,14 @@ dependency、priority、retry、意味的な結果統合は扱わない。
 - shell有効時は一時sandbox内への書き込みまで拒否されるとは限らない。`write_paths=()`は永続的な書き込み先をanswer forkへ設定しない契約である。
 - `ReviewConfig.context`はreviewerの評価基準・指示であり、会話履歴ではない。
 - automatic peer reviewは同じReviewer sessionを初回から全roundで再利用する。
-- peer reviewのReviewer判定turnには、open finding IDと初回・再査読の別からRunnerが生成したstrict JSON SchemaをSDK output schemaとして渡す。
-- Mainの回答作成turnには、Runner生成change IDとopen finding IDから生成したstrict JSON SchemaをSDK output schemaとして渡す。
+- peer review protocol v3はopen/closed findings、Runner生成changes、Main回答をpackageに含める。closed findingは`finding_id`、要求本文の`comment`、終了判定コメントの`decision_comment`（なければnull）、`resolution`、`main_response`を保持する。Reviewerのstrict JSON Schemaはopen/closed IDと初回・再査読の別から生成する。
+- Mainのfinding回答は直近の完了済み会話から作る一時answer forkで実行し、Main自身の履歴へ回答指示を入れない。open IDに対応するstrict JSON Schemaを使い、補正も同じforkで行い、成否にかかわらずcloseする。activity actorは`[Main Answer]`とする。
+- 次のrepair promptにはReviewerのcommentとMainの最新回答を併記する。custom templateに`{review_findings}`がなければRunnerが追記する。
+- 新findingのrelationは`new` / `reopens` / `revises` / `conflicts`を必須とする。`reopens`は元IDを再開し、resolved findingへの`revises`は両立する修正案と新IDを要求する。
+- decisionまたはrelationの`conflicts`は即時に`CodexReviewConflictError`（`CodexValidationError`派生）を送出し、両側のID・要求本文のcomment・Main回答を`conflicting_findings`に保持する。decision形式のReviewer説明は例外文に分けて保持する。
 - SDK output schemaで表現できないIDの完全被覆、順序、双方向参照、およびdisposition間の相関はRunnerのlocal parserで検証する。
 - Reviewer判定のJSONまたはprotocol不適合は、同じReviewer sessionへ診断を返す修正turnで再生成する。artifact読取失敗や実行errorは修正対象にしない。
+- 回答fork・Reviewerの実行失敗は派生例外をそのまま伝播し、汎用の`CodexExecutionError`だけを変換して、stdout/stderr、収集files、activity log、log_pathを保持する。API/stream errorの原因文もactivityに記録する。`CodexReviewProtocolError`は成功turnの補正後も残るprotocol不適合とRunner invariant違反に使う。
 - 起動したJobまたはBatchは、完了まで待つかcancelする。
 - job実行のfinal reportには、成功時は`response.log_path`、失敗時はerrorの`log_path`を示す。
 - job実行中のlogは、ユーザーまたは適用中の`AGENTS.md`がwatchを明示した場合だけ反復取得する。

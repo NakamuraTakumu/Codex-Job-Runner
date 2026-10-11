@@ -84,6 +84,17 @@ class CodexValidationError(CodexExecutionError):
         self.review_argv = list(review_argv or [])
 
 
+class CodexReviewConflictError(CodexValidationError):
+    """Raised immediately when peer-review requirements cannot coexist."""
+
+    def __init__(self, message, *, conflicting_findings, round_index=None,
+                 review_artifact_paths=(), **kwargs):
+        super().__init__(message, failure_stage="review", **kwargs)
+        self.round_index = round_index
+        self.review_artifact_paths = tuple(review_artifact_paths)
+        self.conflicting_findings = tuple(dict(item) for item in conflicting_findings)
+
+
 class CodexReviewProtocolError(CodexExecutionError):
     """Raised when a peer-review protocol artifact or ledger is invalid."""
 

@@ -15,7 +15,7 @@ from .errors import (
     CodexReviewerDecisionValidationError,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # Each protocol output gets the first answer plus at most this many corrections.
 MAX_CORRECTIONS = 2
 # A finding judged unresolved this many re-reviews in a row stops the job as non-convergent.
@@ -30,8 +30,21 @@ def _id_schema(values: list[str] | tuple[str, ...]) -> dict[str, Any]:
     return schema
 
 
-def reviewer_decision_schema(*, open_ids: tuple[str, ...], initial: bool) -> dict[str, Any]:
+def reviewer_decision_schema(*, open_ids: tuple[str, ...], initial: bool,
+                             closed_findings=()) -> dict[str, Any]:
     """Return the SDK schema for a Reviewer protocol decision turn."""
+    closed_ids = tuple(item["finding_id"] for item in closed_findings)
+    def nullable_id(ids):
+        return {"anyOf": [_id_schema(ids), {"type": "null"}]} if ids else {"type": "null"}
+    relation = {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["new", "reopens", "revises", "conflicts"] if closed_ids else ["new"]},
+            "finding_id": nullable_id(closed_ids),
+        },
+        "required": ["kind", "finding_id"],
+        "additionalProperties": False,
+    }
     decisions: dict[str, Any] = {
         "type": "array",
         "items": {
@@ -40,11 +53,12 @@ def reviewer_decision_schema(*, open_ids: tuple[str, ...], initial: bool) -> dic
                 "finding_id": _id_schema(open_ids),
                 "resolution": {
                     "type": "string",
-                    "enum": ["resolved", "withdrawn", "unresolved"],
+                    "enum": ["resolved", "withdrawn", "unresolved", "conflicts"],
                 },
                 "comment": {"type": "string"},
+                "conflicts_with": nullable_id((*open_ids, *closed_ids)),
             },
-            "required": ["finding_id", "resolution", "comment"],
+            "required": ["finding_id", "resolution", "comment", "conflicts_with"],
             "additionalProperties": False,
         },
         "minItems": 0 if initial else len(open_ids),
@@ -58,8 +72,8 @@ def reviewer_decision_schema(*, open_ids: tuple[str, ...], initial: bool) -> dic
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "properties": {"comment": {"type": "string", "minLength": 1}},
-                    "required": ["comment"],
+                    "properties": {"comment": {"type": "string", "minLength": 1}, "relation": relation},
+                    "required": ["comment", "relation"],
                     "additionalProperties": False,
                 },
             },
@@ -115,9 +129,11 @@ def _keys(value: dict[str, Any], expected: set[str], *, name: str) -> None:
         )
 
 
-def parse_reviewer_decision(text: str, *, open_ids: tuple[str, ...], initial: bool) -> dict[str, Any]:
+def parse_reviewer_decision(text: str, *, open_ids: tuple[str, ...], initial: bool,
+                            closed_findings=()) -> dict[str, Any]:
     try:
-        return _parse_reviewer_decision(text, open_ids=open_ids, initial=initial)
+        return _parse_reviewer_decision(text, open_ids=open_ids, initial=initial,
+                                        closed_findings=closed_findings)
     except CodexReviewerDecisionValidationError:
         raise
     except CodexReviewProtocolError as exc:
@@ -127,7 +143,8 @@ def parse_reviewer_decision(text: str, *, open_ids: tuple[str, ...], initial: bo
         ) from exc
 
 
-def _parse_reviewer_decision(text: str, *, open_ids: tuple[str, ...], initial: bool) -> dict[str, Any]:
+def _parse_reviewer_decision(text: str, *, open_ids: tuple[str, ...], initial: bool,
+                             closed_findings=()) -> dict[str, Any]:
     value = _object(text, name="reviewer decision")
     _keys(value, {"decisions", "new_findings"}, name="reviewer decision")
     decisions, new = value["decisions"], value["new_findings"]
@@ -135,25 +152,54 @@ def _parse_reviewer_decision(text: str, *, open_ids: tuple[str, ...], initial: b
         raise CodexReviewProtocolError("reviewer decision arrays are required")
     if initial and decisions:
         raise CodexReviewProtocolError("initial review must not decide existing findings")
+    closed = {item["finding_id"]: item for item in closed_findings}
     seen = set()
     for item in decisions:
         if not isinstance(item, dict):
             raise CodexReviewProtocolError("reviewer decision entries must be objects")
-        _keys(item, {"finding_id", "resolution", "comment"}, name="reviewer decision entry")
+        _keys(item, {"finding_id", "resolution", "comment", "conflicts_with"}, name="reviewer decision entry")
         fid, resolution, comment = item["finding_id"], item["resolution"], item["comment"]
         if not isinstance(fid, str) or fid in seen or fid not in open_ids:
             raise CodexReviewProtocolError("reviewer decisions must cover each open finding once")
-        if resolution not in {"resolved", "withdrawn", "unresolved"} or not isinstance(comment, str):
+        if not isinstance(resolution, str) or resolution not in {"resolved", "withdrawn", "unresolved", "conflicts"} or not isinstance(comment, str):
             raise CodexReviewProtocolError("invalid reviewer decision")
+        other = item["conflicts_with"]
+        if resolution == "conflicts":
+            if not isinstance(other, str) or other == fid or other not in {*open_ids, *closed}:
+                raise CodexReviewProtocolError("conflicts_with must name another open or closed finding")
+        elif other is not None:
+            raise CodexReviewProtocolError("conflicts_with must be null unless resolution is conflicts")
         seen.add(fid)
     if set(open_ids) != seen:
         raise CodexReviewProtocolError("reviewer decision omits an open finding")
+    reopened = set()
     for item in new:
         if not isinstance(item, dict):
             raise CodexReviewProtocolError("new findings must be objects")
-        _keys(item, {"comment"}, name="new finding")
+        _keys(item, {"comment", "relation"}, name="new finding")
         if not isinstance(item["comment"], str) or not item["comment"].strip():
             raise CodexReviewProtocolError("new finding comment must be non-empty")
+        relation = item["relation"]
+        if not isinstance(relation, dict):
+            raise CodexReviewProtocolError("relation must be an object")
+        _keys(relation, {"kind", "finding_id"}, name="finding relation")
+        kind, fid = relation["kind"], relation["finding_id"]
+        if not isinstance(kind, str):
+            raise CodexReviewProtocolError("relation kind must be a string")
+        if kind == "new":
+            if fid is not None:
+                raise CodexReviewProtocolError("new relation requires null finding_id")
+        elif kind in {"reopens", "revises", "conflicts"}:
+            if not isinstance(fid, str) or fid not in closed:
+                raise CodexReviewProtocolError("relation must name a closed finding")
+            if kind == "reopens":
+                if fid in reopened:
+                    raise CodexReviewProtocolError("reopens must name each closed finding at most once")
+                reopened.add(fid)
+            if kind in {"revises", "conflicts"} and closed[fid]["resolution"] != "resolved":
+                raise CodexReviewProtocolError("revises/conflicts requires a resolved finding")
+        else:
+            raise CodexReviewProtocolError("invalid relation kind")
     return value
 
 
@@ -172,7 +218,7 @@ def parse_main_response(text: str, *, open_ids: tuple[str, ...]) -> list[dict[st
         fid = item["finding_id"]
         if not isinstance(fid, str) or fid in by_finding or fid not in open_ids:
             raise CodexReviewProtocolError("finding responses must answer each open finding once")
-        if item["disposition"] not in {"addressed", "not_addressed", "disputed"}:
+        if not isinstance(item["disposition"], str) or item["disposition"] not in {"addressed", "not_addressed", "disputed"}:
             raise CodexReviewProtocolError("invalid finding disposition")
         if not isinstance(item["response"], str) or not item["response"].strip():
             raise CodexReviewProtocolError("finding response text must be non-empty")

@@ -575,6 +575,11 @@ def _stream_activity_from_line(line, *, detail=None, attempt=None, repair_index=
             message = f"stream event observed: {event_type} ({item_type}): {item_text}"
         elif isinstance(item_type, str):
             message = f"stream event observed: {event_type} ({item_type})"
+    elif event_type in {"error", "turn.failed"}:
+        error = event.get("error")
+        error_text = event.get("message") or (error.get("message") if isinstance(error, dict) else error)
+        if error_text:
+            message = f"stream event observed: {event_type}: {error_text}"
     elif event_type == "subagent.lifecycle":
         message = _describe_subagent_event(event)
     elif event_type == "plan.updated":
@@ -1034,6 +1039,7 @@ def _activity_actor(phase):
         "main_attempt": "Main Attempt",
         "validator": "Validator",
         "review": "Reviewer",
+        "finding_response": "Main Answer",
         "repair": "Repair",
         "file_collection": "File Collection",
         "cleanup": "Cleanup",
@@ -1044,6 +1050,8 @@ def _activity_actor(phase):
 
 def _stream_actor(entry):
     origin = getattr(entry, "detail", None)
+    if origin == "finding_response":
+        return "Main Answer"
     if origin == "review":
         return "Reviewer"
     if origin == "validator":
@@ -1558,8 +1566,18 @@ def _consume_turn_via_stream(process, turn):
                     getattr(payload, "token_usage", getattr(payload, "tokenUsage", None))
                 )
                 continue
+            if method in {"error", "turn/error", "turn.error"}:
+                error = getattr(payload, "error", payload)
+                message = getattr(error, "message", None) or str(error)
+                _append_stream_event(stdout_lines, process,
+                                     {"type": "error", "message": message})
+                continue
             if method in {"turn/completed", "turn.completed"}:
                 completed_turn = getattr(payload, "turn", None)
+                error = getattr(completed_turn, "error", None)
+                if error is not None:
+                    _append_stream_event(stdout_lines, process,
+                                         {"type": "error", "message": getattr(error, "message", str(error))})
                 event_payload = {"type": "turn.completed"}
                 if usage is not None:
                     event_payload["usage"] = usage

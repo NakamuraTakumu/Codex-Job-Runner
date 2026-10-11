@@ -926,6 +926,137 @@ class CodexClientTests(unittest.TestCase):
                 timeout=3,
             )
 
+    def test_finding_answers_use_restricted_fork_and_same_fork_for_correction(self):
+        for shell in (True, False):
+            with self.subTest(shell=shell):
+                first_config = len(self.sdk_configs)
+                first_thread = set(self.sdk_threads)
+                forks = []
+                original_fork = CodexSession.fork
+                original_response = self._fake_final_response
+                answer_count = 0
+                def capture_fork(source, **kwargs):
+                    fork = original_fork(source, **kwargs)
+                    forks.append(fork)
+                    return fork
+                def respond(prompt):
+                    nonlocal answer_count
+                    if "This is an answer turn" in prompt and "You are a peer reviewer" not in prompt:
+                        answer_count += 1
+                        if answer_count == 1:
+                            return "invalid JSON"
+                    return original_response(prompt)
+                def echo(value: str) -> str:
+                    return value
+                tool = Tool(echo, "Echo", args={"value": "value"}, returns="value")
+                job = CodexJob(
+                    config=SessionConfig(allow_shell_commands=shell,
+                        tools=ToolConfig(tools=(tool,)),
+                        workspace=WorkspaceConfig(cwd=self.project)),
+                    input="REVIEW_TRIGGER_REPAIR",
+                    review=ReviewConfig(context="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE"),
+                )
+                hooks = []
+                job.hooks.before_main_attempt.append(lambda: hooks.append("main"))
+                with mock.patch.object(CodexSession, "fork", capture_fork), mock.patch.object(self, "_fake_final_response", respond):
+                    response = job.run()
+                self.assertEqual(response.content, "review repaired answer")
+                self.assertEqual(hooks, ["main", "main"])
+                self.assertEqual(len(forks), 1)
+                fork = forks[0]
+                self.assertTrue(fork._session_closed)
+                self.assertIsNone(fork._turn_session)
+                self.assertEqual(fork.config.workspace.write_paths, ())
+                self.assertIsNone(fork.config.tools)
+                self.assertEqual(fork.config.allowed_skills, ())
+                self.assertTrue(fork.config.ignore_global_context)
+                self.assertEqual(fork.config.allow_shell_commands, shell)
+                new_threads = [thread for key, thread in self.sdk_threads.items() if key not in first_thread]
+                main, reviewer, answer = new_threads
+                self.assertEqual(len(main.prompts), 2)
+                self.assertFalse(any("This is an answer turn" in p for p in main.prompts))
+                self.assertFalse(any("Your prior finding response" in p for p in main.prompts))
+                self.assertIn("This is an answer turn", answer.prompts[-2])
+                self.assertIn("Your prior finding response was invalid", answer.prompts[-1])
+                overrides = self.sdk_configs[first_config + 2].config_overrides
+                for value in ("mcp_servers={}", "features.hooks=false", "features.multi_agent=false", "skills.include_instructions=false"):
+                    self.assertIn(value, overrides)
+                permissions = [v for v in overrides if v.startswith("permissions.") and ".filesystem=" in v]
+                self.assertTrue(permissions)
+                self.assertNotIn('"write"', "".join(permissions))
+                answer_calls = [call for prompt, call in zip(self.thread_prompts, self.turn_calls) if "This is an answer turn" in prompt]
+                self.assertTrue(all(call["output_schema"]["required"] == ["finding_responses"] for call in answer_calls))
+                self.assertGreater(job.total_usage["input_tokens"], 450)
+                self.assertEqual(job.total_usage_by_model[job.config.model], job.total_usage)
+                self.assertGreater(job.total_estimated_cost_usd, 0)
+                self.assertEqual(job.total_estimated_cost_usd_by_model[job.config.model], job.total_estimated_cost_usd)
+
+    def test_answer_fork_sdk_failure_is_execution_error_and_closes_fork(self):
+        forks = []
+        original_fork = CodexSession.fork
+        def capture_fork(source, **kwargs):
+            fork = original_fork(source, **kwargs)
+            forks.append(fork)
+            return fork
+        def fail_answer(prompt, context_prompt):
+            if prompt.startswith("This is an answer turn"):
+                raise RuntimeError("stream disconnected")
+        self.fake_turn_callback = fail_answer
+        job = CodexJob(config=SessionConfig(workspace=WorkspaceConfig(cwd=self.project)),
+                       input="REVIEW_TRIGGER_REPAIR",
+                       review=ReviewConfig(context="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE"))
+        with mock.patch.object(CodexSession, "fork", capture_fork), self.assertRaises(CodexExecutionError) as caught:
+            job.run()
+        self.assertIs(type(caught.exception), CodexExecutionError)
+        self.assertIn("stream disconnected", str(caught.exception))
+        self.assertIn("stream disconnected", pathlib.Path(caught.exception.log_path).read_text())
+        self.assertEqual(len(forks), 1)
+        self.assertTrue(forks[0]._session_closed)
+        self.assertIsNone(forks[0]._turn_session)
+        self.assertFalse(any("This is an answer turn" in p for p in next(iter(self.sdk_threads.values())).prompts))
+
+    def test_reviewer_sdk_failure_is_execution_error_with_files(self):
+        def fail_review(prompt, context_prompt):
+            if prompt.startswith("You are a peer reviewer"):
+                raise RuntimeError("OpenAI API error")
+        self.fake_turn_callback = fail_review
+        client = CodexClient(cwd=str(self.project))
+        with self.assertRaises(CodexExecutionError) as caught:
+            client.run(input="x", review=ReviewConfig(context="REVIEW_SHOULD_PASS"),
+                       subcwd_files={"output.txt": {"text": "preserved"}},
+                       write_paths=["${SUBCWD}/output.txt"], collect_files=True)
+        self.assertIs(type(caught.exception), CodexExecutionError)
+        self.assertIn("OpenAI API error", str(caught.exception))
+        self.assertEqual(caught.exception.files["output.txt"].text, "preserved")
+        self.assertIn("OpenAI API error", pathlib.Path(caught.exception.log_path).read_text())
+
+    def test_new_review_fields_are_corrected_in_same_reviewer_thread(self):
+        original_response = self._fake_final_response
+        reviewer_turns = 0
+        def respond(prompt):
+            nonlocal reviewer_turns
+            latest = self.thread_prompts[-1]
+            if latest.startswith("You are a peer reviewer") or latest.startswith("Your immediately preceding reviewer decision"):
+                reviewer_turns += 1
+                if reviewer_turns == 1:
+                    return '{"decisions":[],"new_findings":[{"comment":"fix","relation":{"kind":"reopens","finding_id":"F999"}}]}'
+                if reviewer_turns == 2:
+                    return '{"decisions":[],"new_findings":[{"comment":"Please change the final response to review repaired answer.","relation":{"kind":"new","finding_id":null}}]}'
+                if reviewer_turns == 3:
+                    return '{"decisions":[{"finding_id":"F001","resolution":"resolved","comment":"ok"}],"new_findings":[]}'
+                return '{"decisions":[{"finding_id":"F001","resolution":"resolved","comment":"ok","conflicts_with":null}],"new_findings":[]}'
+            return original_response(prompt)
+        with mock.patch.object(self, "_fake_final_response", respond):
+            CodexJob(config=SessionConfig(workspace=WorkspaceConfig(cwd=self.project)),
+                     input="REVIEW_TRIGGER_REPAIR",
+                     review=ReviewConfig(context="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE")).run()
+        reviewer = list(self.sdk_threads.values())[1]
+        self.assertEqual(len(reviewer.prompts), 4)
+        self.assertIn("comment (the requirement), decision_comment (the closing reviewer comment, or null)",
+                      reviewer.prompts[0])
+        self.assertIn("relation must name a closed finding", reviewer.prompts[1])
+        self.assertIn("conflicts_with", reviewer.prompts[3])
+
     def test_peer_exchange_forks_each_parent_without_mutating_it(self):
         captured = {}
         real_bridge = client_module._ToolBridge
@@ -1049,7 +1180,7 @@ class CodexClientTests(unittest.TestCase):
             ),
             1,
         )
-        self.assertEqual(len(fork_configs), 2)
+        self.assertEqual(len(fork_configs), 3)  # ask_peer twice plus Main answer
         for fork_config in fork_configs:
             self.assertIn("mcp_servers={}", fork_config.config_overrides)
             self.assertIn("features.hooks=false", fork_config.config_overrides)
@@ -1057,7 +1188,8 @@ class CodexClientTests(unittest.TestCase):
                 "features.multi_agent=false",
                 fork_config.config_overrides,
             )
-        reviewer_to_main_fork, main_to_reviewer_fork = fork_configs
+        reviewer_to_main_fork, main_to_reviewer_fork, main_answer_fork = fork_configs
+        self.assertIn('web_search="live"', main_answer_fork.config_overrides)
         self.assertIn('web_search="live"', peer_configs[0].config_overrides)
         self.assertIn('web_search="disabled"', peer_configs[1].config_overrides)
         self.assertIn('web_search="live"', reviewer_to_main_fork.config_overrides)
@@ -3723,11 +3855,11 @@ class CodexClientTests(unittest.TestCase):
             ):
                 content = (
                     '{"decisions": [{"finding_id": "F001", '
-                    '"resolution": "unresolved", "comment": "still fails"}], '
+                    '"conflicts_with":null,"resolution": "unresolved", "comment": "still fails"}], '
                     '"new_findings": []}'
                     if '"open_findings": []' not in message else
                     '{"decisions": [], "new_findings": '
-                    '[{"comment": "review still fails"}]}'
+                    '[{"relation":{"kind":"new","finding_id":null},"comment": "review still fails"}]}'
                 )
                 return SimpleNamespace(
                     content=content,
@@ -3826,9 +3958,9 @@ class CodexClientTests(unittest.TestCase):
             def _send(self, message, *, output_schema_path=None, activity_callback=None):
                 captured["messages"].append(message)
                 if '"open_findings": []' in message:
-                    content = '{"decisions": [], "new_findings": [{"comment": "Please change the final response to review repaired answer."}]}'
+                    content = '{"decisions": [], "new_findings": [{"relation":{"kind":"new","finding_id":null},"comment": "Please change the final response to review repaired answer."}]}'
                 else:
-                    content = '{"decisions": [{"finding_id": "F001", "resolution": "resolved", "comment": "ok"}], "new_findings": []}'
+                    content = '{"decisions": [{"finding_id": "F001", "conflicts_with":null,"resolution": "resolved", "comment": "ok"}], "new_findings": []}'
                 return SimpleNamespace(
                     content=content,
                     stdout="",
@@ -4997,9 +5129,9 @@ class CodexClientTests(unittest.TestCase):
             if "REVIEW_FORCE_BAD_OUTPUT" in prompt:
                 final_answer = "not json"
             elif '"open_findings": []' not in prompt.rsplit("review-package.json:", 1)[-1]:
-                final_answer = '{"decisions":[{"finding_id":"F001","resolution":"resolved","comment":"ok"}],"new_findings":[]}'
+                final_answer = '{"decisions":[{"finding_id":"F001","conflicts_with":null,"resolution":"resolved","comment":"ok"}],"new_findings":[]}'
             elif ("REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE" in prompt or "Unverified Salary Blog" in prompt):
-                final_answer = '{"decisions":[],"new_findings":[{"comment":"Please change the final response to review repaired answer."}]}'
+                final_answer = '{"decisions":[],"new_findings":[{"relation":{"kind":"new","finding_id":null},"comment":"Please change the final response to review repaired answer."}]}'
             else:
                 final_answer = '{"decisions":[],"new_findings":[]}'
         if "Your immediately preceding reviewer decision is invalid" in prompt:
@@ -5016,9 +5148,9 @@ class CodexClientTests(unittest.TestCase):
                 final_answer = "not json"
             elif "CHECK_REVIEW_CONTEXT" in prompt:
                 if "Original request:\nREVIEW_CONTEXT_MARKER" not in prompt:
-                    final_answer = '{"decisions":[],"new_findings":[{"comment":"missing original input"}]}'
+                    final_answer = '{"decisions":[],"new_findings":[{"relation":{"kind":"new","finding_id":null},"comment":"missing original input"}]}'
                 elif "REQUIRE_MAIN_CONTEXT" in prompt and "Main job context:" not in prompt:
-                    final_answer = '{"decisions":[],"new_findings":[{"comment":"missing main context"}]}'
+                    final_answer = '{"decisions":[],"new_findings":[{"relation":{"kind":"new","finding_id":null},"comment":"missing main context"}]}'
                 else:
                     final_answer = '{"decisions":[],"new_findings":[]}'
             elif "REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE" in prompt:
@@ -5026,15 +5158,15 @@ class CodexClientTests(unittest.TestCase):
                     "Revised main job final response:\nreview repaired answer"
                     in prompt
                 ):
-                    final_answer = '{"decisions":[{"finding_id":"F001","resolution":"resolved","comment":"ok"}],"new_findings":[]}'
+                    final_answer = '{"decisions":[{"finding_id":"F001","conflicts_with":null,"resolution":"resolved","comment":"ok"}],"new_findings":[]}'
                 elif "Main job final response:\nneeds review fix" in prompt:
-                    final_answer = '{"decisions":[],"new_findings":[{"comment":"Please change the final response to review repaired answer."}]}'
+                    final_answer = '{"decisions":[],"new_findings":[{"relation":{"kind":"new","finding_id":null},"comment":"Please change the final response to review repaired answer."}]}'
                 else:
                     final_answer = '{"decisions":[],"new_findings":[]}'
             elif "Use the references in the JSON output as the starting point for verification." in prompt:
                 reviewed_response = self._extract_review_main_response(prompt)
                 if "Unverified Salary Blog" in reviewed_response:
-                    final_answer = '{"decisions":[],"new_findings":[{"comment":"Replace the salary reference with a primary or otherwise reliable salary source."}]}'
+                    final_answer = '{"decisions":[],"new_findings":[{"relation":{"kind":"new","finding_id":null},"comment":"Replace the salary reference with a primary or otherwise reliable salary source."}]}'
                 else:
                     final_answer = '{"decisions":[],"new_findings":[]}'
             else:

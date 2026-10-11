@@ -44,6 +44,7 @@ from .errors import (
     CodexTimeoutError,
     CodexValidationError,
     CodexReviewProtocolError,
+    CodexReviewConflictError,
 )
 from ._session import CodexSession
 from ._job import _ValidationStepOutcome
@@ -283,6 +284,9 @@ def _format_open_finding(record):
     text = f"{record['finding_id']}: {record['comment']}"
     if record.get("status") == "unresolved":
         text += f"\n  Reviewer (unresolved): {record['decision_comment']}"
+    answer = record.get("main_response")
+    if answer is not None:
+        text += f"\n  Main ({answer['disposition']}): {answer['response']}"
     return text
 
 class CodexJob(CodexSession):
@@ -976,6 +980,7 @@ class CodexJob(CodexSession):
         ignore_global_context=False,
         review_config=None,
         review_runner=None,
+        open_answer_fork=None,
         collect_files=False,
         max_files=_DEFAULT_MAX_FILES,
         max_file_bytes=_DEFAULT_MAX_FILE_BYTES,
@@ -1019,6 +1024,7 @@ class CodexJob(CodexSession):
         self._ignore_global_context = ignore_global_context
         self._review_config = review_config
         self._review_runner = review_runner
+        self._open_answer_fork = open_answer_fork
         self._should_collect_files = collect_files
         self._max_files = max_files
         self._max_file_bytes = max_file_bytes
@@ -1370,26 +1376,27 @@ class CodexJob(CodexSession):
                 )
 
     def _set_execution_error(self, returncode):
+        error = self._execution_error(returncode, stdout=self._stdout,
+                                      stderr=self._stderr, argv=self.argv)
+        with self._lock:
+            self._status = _FAILED
+            self._error = error
+
+    def _execution_error(self, returncode, *, stdout="", stderr="", argv=()):
+        """One execution-failure path for Main, its answer fork, and Reviewer."""
         files, collection_error = self._collect_output_files()
         message = f"codex job exited with status {returncode}"
         if collection_error is not None:
             message += f"; file collection failed: {collection_error}"
-        if self._stderr:
-            message += f"\nstderr:\n{self._stderr}"
-        if self._stdout:
-            message += f"\nstdout:\n{self._stdout}"
-        with self._lock:
-            self._status = _FAILED
-            self._error = CodexExecutionError(
-                message,
-                returncode=returncode,
-                stdout=self._stdout,
-                stderr=self._stderr,
-                argv=self.argv,
-                files=files,
-                activity_log=self._activity_log_snapshot(),
-                log_path=self.log_path,
-            )
+        if stderr:
+            message += f"\nstderr:\n{stderr}"
+        if stdout:
+            message += f"\nstdout:\n{stdout}"
+        return CodexExecutionError(
+            message, returncode=returncode, stdout=stdout, stderr=stderr,
+            argv=argv, files=files, activity_log=self._activity_log_snapshot(),
+            log_path=self.log_path,
+        )
 
     def _set_validation_error(self, *, response, validation, attempts, repairs):
         response = self._with_additional_usage(response)
@@ -1692,7 +1699,7 @@ class CodexJob(CodexSession):
                 self._log_activity(
                     "review",
                     "error",
-                    f"review failed: {exc.message}",
+                    f"review failed: {exc.message}\n{exc.stderr or exc.stdout}",
                     attempt=attempt_index,
                     repair_index=repair_index,
                     argv=exc.argv,
@@ -1700,7 +1707,10 @@ class CodexJob(CodexSession):
                     stdout=exc.stdout,
                     stderr=exc.stderr,
                 )
-                raise
+                if type(exc) is not CodexExecutionError:
+                    raise
+                raise self._execution_error(exc.returncode, stdout=exc.stdout,
+                                            stderr=exc.stderr or exc.message, argv=exc.argv) from exc
             except Exception as exc:
                 self._log_activity(
                     "review",
@@ -1883,9 +1893,23 @@ class CodexJob(CodexSession):
             "schema_version": PEER_SCHEMA_VERSION,
             "round": self._peer_round,
             "open_findings": open_findings,
+            "closed_findings": [
+                {"finding_id": item["finding_id"],
+                 "comment": item["comment"],
+                 "decision_comment": item.get("decision_comment"),
+                 "resolution": item["status"],
+                 "main_response": item.get("main_response")}
+                for item in self._peer_findings
+                if item["status"] in {"resolved", "withdrawn"}
+            ],
             "changes": change_list,
             "finding_responses": finding_responses,
         }
+        for answer in finding_responses:
+            record = next(item for item in self._peer_findings
+                          if item["finding_id"] == answer["finding_id"])
+            record["main_response"] = {"disposition": answer["disposition"],
+                                       "response": answer["response"]}
         peer_dump_package(directory / "review-package.json", package)
         protocol = {
             "initial": initial,
@@ -1907,12 +1931,35 @@ class CodexJob(CodexSession):
         peer_dump(directory / "reviewer-decision.json", decision)
         records = {item["finding_id"]: item for item in self._peer_findings}
         for item in decision["decisions"]:
+            if item["resolution"] == "conflicts":
+                self._raise_review_conflict(
+                    first={"finding_id": item["finding_id"], "comment": records[item["finding_id"]]["comment"],
+                           "main_response": records[item["finding_id"]].get("main_response")},
+                    other=records[item["conflicts_with"]], response=response,
+                    review=result, attempt_index=attempt_index, repair_index=repair_index,
+                    reviewer_comment=item["comment"],
+                )
+        for item in decision["new_findings"]:
+            if item["relation"]["kind"] == "conflicts":
+                self._raise_review_conflict(
+                    first={"finding_id": None, "comment": item["comment"], "main_response": None},
+                    other=records[item["relation"]["finding_id"]], response=response,
+                    review=result, attempt_index=attempt_index, repair_index=repair_index,
+                )
+        for item in decision["decisions"]:
             record = records[item["finding_id"]]
             record["status"] = item["resolution"]
             record["decision_comment"] = item["comment"]
             record["unresolved_streak"] = record.get("unresolved_streak", 0) + 1 if item["resolution"] == "unresolved" else 0
             if item["resolution"] != "unresolved": self._peer_ledger.pop(item["finding_id"], None)
         for item in decision["new_findings"]:
+            if item["relation"]["kind"] == "reopens":
+                fid = item["relation"]["finding_id"]
+                record = records[fid]
+                record.update(comment=item["comment"], status="open", unresolved_streak=0)
+                record.pop("decision_comment", None)
+                self._peer_ledger[fid] = item["comment"]
+                continue
             fid = f"F{self._peer_next_finding:03d}"; self._peer_next_finding += 1
             self._peer_ledger[fid] = item["comment"]
             self._peer_findings.append({"finding_id": fid, "comment": item["comment"],
@@ -1936,11 +1983,37 @@ class CodexJob(CodexSession):
         self._last_review_result = result
         return result
 
+    def _raise_review_conflict(self, *, first, other, response, review,
+                               attempt_index, repair_index, reviewer_comment=None):
+        second = {"finding_id": other["finding_id"],
+                  "comment": other["comment"],
+                  "main_response": other.get("main_response")}
+        sides = (first, second)
+        message = "peer review conflict: " + " vs ".join(
+            f"{item['finding_id'] or 'new finding'}: {item['comment'][:120]}"
+            for item in sides
+        )
+        if reviewer_comment is not None:
+            message += "; reviewer: " + reviewer_comment[:200]
+        files, collection_error = self._collect_output_files()
+        if collection_error is not None:
+            message += f"; file collection failed: {collection_error}"
+        response = replace(self._with_additional_usage(response), files=files,
+                           activity_log=tuple(self._activity_log_snapshot()), log_path=self.log_path)
+        raise CodexReviewConflictError(
+            message, conflicting_findings=sides, round_index=self._peer_round,
+            review_artifact_paths=tuple(map(str, self._review_config.artifact_paths)),
+            response=response, attempts=attempt_index + 1, repairs=repair_index,
+            files=files, review_response=review.response, review_stdout=review.stdout,
+            review_stderr=review.stderr, review_argv=review.argv,
+            activity_log=self._activity_log_snapshot(), log_path=self.log_path,
+        )
+
     def _run_finding_response_turn(self, *, open_findings, directory, attempt_index, repair_index):
         """Ask Main to answer every open finding; this turn never owns changes or content."""
         open_ids = tuple(item["finding_id"] for item in open_findings)
         base_prompt = (
-            "Do not edit any file in this turn. Return only a JSON object with finding_responses. "
+            "This is an answer turn; files cannot be changed in this turn. Return only a JSON object with finding_responses. "
             "Answer every open finding exactly once with disposition addressed, not_addressed, "
             "or disputed and a non-empty response.\n"
             + json.dumps({"open_findings": open_findings}, ensure_ascii=False)
@@ -1951,25 +2024,43 @@ class CodexJob(CodexSession):
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as schema_file:
                 json.dump(main_finding_response_schema(open_ids=open_ids), schema_file, ensure_ascii=False)
-            for correction in range(_PEER_MAX_CORRECTIONS + 1):
-                turn = self._spawn_attempt(prompt=prompt, attempt_index=attempt_index,
-                                           repair_index=repair_index,
-                                           turn_output_schema_path=schema_path)
-                self._log_activity("finding_response", "start", "main finding-response turn started", attempt=attempt_index, repair_index=repair_index)
-                stdout, stderr, returncode, usage = self._run_attempt(turn)
-                if returncode != 0:
-                    raise CodexReviewProtocolError("main finding-response turn failed", round_index=self._peer_round,
-                                                   stdout=stdout, stderr=stderr, argv=turn.argv, log_path=self.log_path)
-                content = self._read_output_file(turn.output_path)
-                model = self._resolved_model_name(turn.argv)
-                self._record_additional_usage(usage=usage, estimated_cost_usd=_estimate_cost_usd_for_usage(usage=usage, pricing=_resolve_model_pricing(model)), model=model, role=f"main finding response round[{self._peer_round}] correction[{correction}]")
-                try:
-                    return parse_main_response(content, open_ids=open_ids)
-                except CodexReviewProtocolError as exc:
-                    peer_dump(directory / f"main-finding-response-attempt-{correction:02d}.txt", content or "")
-                    peer_dump(directory / f"main-finding-response-attempt-{correction:02d}.diagnostic.txt", exc.message)
-                    self._log_activity("finding_response", "invalid", exc.message, attempt=attempt_index, repair_index=repair_index)
-                    prompt = "Your prior finding response was invalid: " + exc.message + "\nReturn a corrected JSON object only.\n" + base_prompt
+            with self._open_answer_fork(base_prompt) as fork:
+                trusted = getattr(fork._turn_session, "_trusted_internal_output_schema_paths", None)
+                if trusted is not None:
+                    trusted.add(schema_path.resolve())
+                for correction in range(_PEER_MAX_CORRECTIONS + 1):
+                    self._log_activity("finding_response", "start", "main answer fork turn started", attempt=attempt_index, repair_index=repair_index)
+                    try:
+                        answer = fork._send_turn(
+                            prompt, output_schema_path=schema_path,
+                            activity_callback=lambda line: self._record_stream_event_line(
+                                line, detail="finding_response", attempt=attempt_index,
+                                repair_index=repair_index),
+                        )
+                        if answer.returncode != 0:
+                            raise CodexExecutionError("main answer fork failed",
+                                returncode=answer.returncode, stdout=answer.stdout,
+                                stderr=answer.stderr, argv=answer.argv)
+                    except CodexExecutionError as exc:
+                        self._log_activity("finding_response", "error", f"{exc}\n{exc.stderr or exc.stdout}",
+                                           stderr=exc.stderr, stdout=exc.stdout,
+                                           attempt=attempt_index, repair_index=repair_index)
+                        if type(exc) is not CodexExecutionError:
+                            raise
+                        raise self._execution_error(exc.returncode, stdout=exc.stdout,
+                                                    stderr=exc.stderr or exc.message, argv=exc.argv) from exc
+                    content, usage = answer.content, answer.usage
+                    model = self._resolved_model_name(answer.argv)
+                    self._record_additional_usage(usage=usage, estimated_cost_usd=_estimate_cost_usd_for_usage(usage=usage, pricing=_resolve_model_pricing(model)), model=model, role=f"main answer round[{self._peer_round}] correction[{correction}]")
+                    self._log_usage_activity(phase="finding_response", model=model, usage=usage,
+                                             attempt=attempt_index, repair_index=repair_index)
+                    try:
+                        return parse_main_response(content, open_ids=open_ids)
+                    except CodexReviewProtocolError as exc:
+                        peer_dump(directory / f"main-finding-response-attempt-{correction:02d}.txt", content or "")
+                        peer_dump(directory / f"main-finding-response-attempt-{correction:02d}.diagnostic.txt", exc.message)
+                        self._log_activity("finding_response", "invalid", exc.message, attempt=attempt_index, repair_index=repair_index)
+                        prompt = "Your prior finding response was invalid: " + exc.message + "\nReturn a corrected JSON object only.\n" + base_prompt
             raise CodexReviewProtocolError(
                 f"main finding response remained invalid after {_PEER_MAX_CORRECTIONS} corrections",
                 round_index=self._peer_round, log_path=self.log_path,
@@ -2127,6 +2218,8 @@ class CodexJob(CodexSession):
             repair_input = self._repair_prompt_template
             for key, value in values.items():
                 repair_input = repair_input.replace("{" + key + "}", value)
+            if values["review_findings"] and "{review_findings}" not in self._repair_prompt_template:
+                repair_input += "\n\nRunner peer-review findings:\n" + values["review_findings"]
         return _build_repair_turn_prompt(input=repair_input)
 
     def _log_repair_prompt_activity(self, prompt, *, failure_stage, attempt, repair_index):

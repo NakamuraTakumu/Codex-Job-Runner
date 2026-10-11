@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from contextlib import contextmanager
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -77,7 +78,7 @@ class PeerReviewProtocolTests(unittest.TestCase):
         self.assertEqual(reviewer["required"], ["decisions", "new_findings"])
         self.assertEqual(
             reviewer["properties"]["decisions"]["items"]["properties"]["resolution"]["enum"],
-            ["resolved", "withdrawn", "unresolved"],
+            ["resolved", "withdrawn", "unresolved", "conflicts"],
         )
         self.assertFalse(main["additionalProperties"])
         self.assertEqual(main["required"], ["finding_responses"])
@@ -100,10 +101,22 @@ class PeerReviewProtocolTests(unittest.TestCase):
         initial = root / "initial.txt"
         if not initial.exists():
             initial.write_text("draft", encoding="utf-8")
+        @contextmanager
+        def open_answer_fork(message):
+            class Fork:
+                _turn_session = SimpleNamespace(_trusted_internal_output_schema_paths=set())
+                def _send_turn(self, prompt, *, output_schema_path, activity_callback):
+                    turn = spawn_attempt(prompt=prompt, attempt_index=1, repair_index=1,
+                                         turn_output_schema_path=output_schema_path)
+                    stdout, stderr = turn.process.communicate(prompt)
+                    return CodexResponse(content=turn.output_path.read_text(),
+                                         returncode=turn.process.returncode, stdout=stdout,
+                                         stderr=stderr, argv=tuple(turn.argv))
+            yield Fork()
         execution = object.__new__(CodexJob)
         execution._initialize_runtime(
             attempt=_CodexAttempt(["codex"], "input", _Process(), initial, 0, 0),
-            spawn_attempt=spawn_attempt, original_input="input", context_paths=(), context_sections=(),
+            spawn_attempt=spawn_attempt, open_answer_fork=open_answer_fork, original_input="input", context_paths=(), context_sections=(),
             output_schema_section=None, output_model_source_section=None, read_paths=(), write_paths=(), subcwd_files=(),
             cwd=root, review_config=SimpleNamespace(artifact_paths=artifact_paths, max_repairs=max_repairs), review_runner=reviewer,
             log_dir=root,
@@ -113,9 +126,9 @@ class PeerReviewProtocolTests(unittest.TestCase):
     @staticmethod
     def _decision(protocol, *, resolution="resolved", comment="ok"):
         if protocol["initial"]:
-            decision = {"decisions": [], "new_findings": [{"comment": "fix it"}]}
+            decision = {"decisions": [], "new_findings": [{"comment": "fix it", "relation": {"kind": "new", "finding_id": None}}]}
         else:
-            decision = {"decisions": [{"finding_id": "F001", "resolution": resolution, "comment": comment}], "new_findings": []}
+            decision = {"decisions": [{"finding_id": "F001", "resolution": resolution, "comment": comment, "conflicts_with": None}], "new_findings": []}
         response = CodexResponse(content="{}", returncode=0, stdout="", stderr="", argv=("review",))
         return _ReviewResult(False, (), "", response, "", "", ["review"], decision=decision)
 
@@ -137,7 +150,7 @@ class PeerReviewProtocolTests(unittest.TestCase):
             execution = self._job(root, spawn_attempt=spawn_attempt, reviewer=reviewer)
             execution.start_background(); response = execution.result(timeout=2)
             self.assertEqual(response.content, "repaired")
-            self.assertEqual(packages[0], {"schema_version": 2, "round": 0, "open_findings": [], "changes": [], "finding_responses": []})
+            self.assertEqual(packages[0], {"schema_version": 3, "round": 0, "open_findings": [], "closed_findings": [], "changes": [], "finding_responses": []})
             self.assertEqual(packages[1]["changes"][0]["diff"], "@@ -1,1 +1,1 @@\n-draft\n+repaired\n")
             self.assertEqual(packages[1]["finding_responses"], [{"finding_id": "F001", "disposition": "addressed", "response": "fixed"}])
             review_root = pathlib.Path(execution.log_path).parent / execution.id / "review"
@@ -154,7 +167,7 @@ class PeerReviewProtocolTests(unittest.TestCase):
                 ],
             )
             ledger = json.loads((review_root / "finding-ledger.json").read_text(encoding="utf-8"))
-            self.assertEqual(ledger["schema_version"], 2)
+            self.assertEqual(ledger["schema_version"], 3)
             self.assertEqual(ledger["payload"][0]["status"], "resolved")
 
     def test_finding_response_fails_after_two_corrections(self):

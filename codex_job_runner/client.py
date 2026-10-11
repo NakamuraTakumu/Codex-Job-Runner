@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from contextlib import contextmanager
 import os
 import pathlib
 import shutil
@@ -932,6 +933,28 @@ def _start_runtime(
                 peer_exchange_state["attempt"] = None
                 peer_exchange_state["repair_index"] = None
 
+    @contextmanager
+    def answer_fork(source_state, readonly_config, message):
+        """Share restricted fork lifetime management with ask_peer."""
+        source = CodexSession(config=readonly_config, _conversation_state=source_state)
+        fork = None
+        try:
+            fork = source.fork(input=message, config=readonly_config)
+            with peer_exchange_lock:
+                if peer_exchange_state["closed"]:
+                    raise RuntimeError("peer exchange is closed")
+                peer_exchange_state["active_forks"].add(fork)
+            yield fork
+        finally:
+            if fork is not None:
+                with peer_exchange_lock:
+                    peer_exchange_state["active_forks"].discard(fork)
+                fork.close()
+            source.close()
+
+    def open_answer_fork(message):
+        return answer_fork(main_conversation_state, main_exchange_config, message)
+
     def ask_peer(message: str) -> str:
         with peer_exchange_lock:
             if peer_exchange_state["closed"]:
@@ -964,21 +987,14 @@ def _start_runtime(
                 f":{peer_exchange_state['sequence']}"
             )
             source_thread_id = source_state.thread_id
-        source = CodexSession(
-            config=readonly_config,
-            _conversation_state=source_state,
-        )
-        fork = None
+        with answer_fork(source_state, readonly_config, message) as fork:
+            return run_peer_answer(fork, readonly_config, message, exchange_id,
+                                   role, target_role, source_thread_id)
+
+    def run_peer_answer(fork, readonly_config, message, exchange_id,
+                        role, target_role, source_thread_id):
+        fork_thread_id = fork._conversation_state.thread_id
         try:
-            fork = source.fork(
-                input=message,
-                config=readonly_config,
-            )
-            fork_thread_id = fork._conversation_state.thread_id
-            with peer_exchange_lock:
-                if peer_exchange_state["closed"]:
-                    raise RuntimeError("peer exchange is closed")
-                peer_exchange_state["active_forks"].add(fork)
             log_peer_exchange(
                 "start",
                 f"peer exchange started: id={exchange_id} "
@@ -1016,12 +1032,6 @@ def _start_runtime(
                 stderr=type(exc).__name__,
             )
             raise
-        finally:
-            if fork is not None:
-                with peer_exchange_lock:
-                    peer_exchange_state["active_forks"].discard(fork)
-                fork.close()
-            source.close()
 
     peer_exchange_tool = (
         Tool(
@@ -1507,6 +1517,7 @@ def _start_runtime(
                         item["finding_id"] for item in protocol["open_findings"]
                     ),
                     initial=protocol["initial"],
+                    closed_findings=protocol["package"]["closed_findings"],
                 ),
                 ensure_ascii=False,
             )
@@ -1541,8 +1552,23 @@ def _start_runtime(
                 review_input = (
                     "You are a peer reviewer. Return only a strict JSON object with "
                     "exactly decisions and new_findings. decisions must decide every "
-                    "open finding using resolved, withdrawn, or unresolved; each new "
-                    "finding has only a non-empty comment. Before deciding, review the "
+                    "open finding using resolved, withdrawn, unresolved, or conflicts, with "
+                    "conflicts_with naming another open or closed finding for conflicts "
+                    "(null otherwise). closed_findings contains finding_id, comment "
+                    "(the requirement), decision_comment (the closing reviewer comment, "
+                    "or null), resolution, and main_response. "
+                    "Every new finding has a non-empty comment and "
+                    "relation {kind, finding_id}: new means unrelated to closed findings "
+                    "and uses null; reopens requests the same correction as closed X "
+                    "(restored under its original ID); revises undoes a change accepted "
+                    "for resolved X but both can be satisfied (describe a fix satisfying "
+                    "both); conflicts undoes a change accepted for resolved X and both "
+                    "cannot be satisfied (the job stops). Non-new relations name closed X. "
+                    "Undoing an accepted change takes precedence: use revises or conflicts "
+                    "even if another closed finding matches. When Main disputed a finding, "
+                    "answer its stated reason in the decision comment: withdraw if accepted, "
+                    "use conflicts if incompatible with another finding, otherwise unresolved "
+                    "with a rebuttal. Before deciding, review the "
                     "current artifact files in the workspace as the review context "
                     "requires.\n\n"
                     + original_request_section
@@ -1633,6 +1659,12 @@ def _start_runtime(
                             model=reviewer_model,
                             role="reviewer turn",
                         )
+                    if review_response.returncode != 0:
+                        raise CodexExecutionError(
+                            "reviewer turn failed", returncode=review_response.returncode,
+                            stdout=review_response.stdout, stderr=review_response.stderr,
+                            argv=review_response.argv,
+                        )
                     if protocol is None:
                         break
                     from ._peer_review import MAX_CORRECTIONS as _PEER_MAX_CORRECTIONS, dump as peer_dump, parse_reviewer_decision
@@ -1644,6 +1676,7 @@ def _start_runtime(
                                 for item in protocol["open_findings"]
                             ),
                             initial=protocol["initial"],
+                            closed_findings=protocol["package"]["closed_findings"],
                         )
                         break
                     except CodexReviewerDecisionValidationError as exc:
@@ -1670,7 +1703,8 @@ def _start_runtime(
                             "decisions and new_findings. Do not add prose, Markdown, "
                             "or fields. Do not invent finding IDs, omit an open finding, "
                             "or use any resolution other than resolved, withdrawn, or "
-                            "unresolved."
+                            "unresolved, or conflicts. Include conflicts_with and every new "
+                            "finding\'s relation as required by the provided schema."
                         )
                 if peer_exchange_enabled:
                     reviewer_exchange_config = _peer_exchange_session_config(
@@ -1705,7 +1739,7 @@ def _start_runtime(
             content = review_response.content
             if protocol is not None:
                 passed = not parsed["new_findings"] and not any(
-                    x["resolution"] == "unresolved" for x in parsed["decisions"]
+                    x["resolution"] in {"unresolved", "conflicts"} for x in parsed["decisions"]
                 )
                 findings = tuple(x["comment"] for x in parsed["new_findings"])
                 summary = "accepted" if passed else "peer review has open findings"
@@ -1765,6 +1799,7 @@ def _start_runtime(
     job._initialize_runtime(
         attempt=attempt,
         spawn_attempt=spawn_attempt,
+        open_answer_fork=open_answer_fork,
         original_input=normalized_input,
         context_paths=context_paths,
         context_sections=context_sections,
@@ -2202,6 +2237,7 @@ def _create_review_session(
         ),
     )
     sdk_session._send = send_turn
+    sdk_session._trusted_internal_output_schema_paths = trusted_internal_output_schema_paths
     session._turn_session = sdk_session
     session._turn_cleanup = sdk_session.close
     session._conversation_state = sdk_session.conversation_state
