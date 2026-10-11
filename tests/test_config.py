@@ -36,6 +36,7 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(first.model, "gpt-5.6-luna")
         self.assertEqual(first.reasoning_effort, "medium")
+        self.assertIsNone(first.web_search)
         self.assertEqual(first.context, ())
         self.assertEqual(dict(first.env), {})
         self.assertIsNone(first.tools)
@@ -68,6 +69,26 @@ class ConfigTests(unittest.TestCase):
             config.timeout = 4
         with self.assertRaises(TypeError):
             config.env["KEY"] = "changed"
+
+    def test_web_search_modes_are_preserved_and_forwarded(self):
+        for mode in (None, "live", "cached", "disabled"):
+            with self.subTest(mode=mode):
+                config = SessionConfig(web_search=mode)
+                self.assertEqual(config.web_search, mode)
+                self.assertEqual(config._runner_kwargs()["web_search"], mode)
+                self.assertEqual(
+                    config.with_overrides(reasoning_effort="high").web_search,
+                    mode,
+                )
+                self.assertIsNone(config.with_overrides(web_search=None).web_search)
+
+    def test_web_search_rejects_invalid_values(self):
+        for value in ("", "LIVE", " live ", "auto", True, 1, [], {}, object()):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "web_search"):
+                    SessionConfig(web_search=value)
+                with self.assertRaisesRegex(ValueError, "web_search"):
+                    SessionConfig(web_search="live").with_overrides(web_search=value)
 
     def test_session_validates_nested_configs(self):
         with self.assertRaisesRegex(TypeError, "workspace"):

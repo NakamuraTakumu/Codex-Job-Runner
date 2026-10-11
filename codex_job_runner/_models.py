@@ -81,6 +81,7 @@ class _ResolvedOptions:
     subagent_context_policy: str
     default_subagent_model: Optional[str]
     default_subagent_reasoning_effort: Optional[str]
+    web_search: Optional[str] = None
 
 
 @dataclass(frozen=True)

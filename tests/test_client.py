@@ -103,6 +103,95 @@ class CodexClientTests(unittest.TestCase):
         if response.content != '{"ok": true}':
             raise ValueError("return the repaired JSON")
 
+    def test_web_search_reaches_public_job_and_session_sdk_configs(self):
+        for mode in (None, "live", "cached", "disabled"):
+            for session_type in (CodexJob, CodexSession):
+                with self.subTest(mode=mode, session_type=session_type.__name__):
+                    config = SessionConfig(
+                        web_search=mode,
+                        workspace=WorkspaceConfig(cwd=self.project),
+                    )
+                    first = len(self.sdk_configs)
+                    with session_type(config=config, input="x") as session:
+                        session.run()
+                    self.assertEqual(len(self.sdk_configs[first:]), 1)
+                    self.assertEqual(
+                        [v for v in self.sdk_configs[first].config_overrides
+                         if v.startswith("web_search=")],
+                        [] if mode is None else [f'web_search="{mode}"'],
+                    )
+
+    def test_web_search_is_retained_during_validation_repair(self):
+        job = CodexJob(
+            config=SessionConfig(
+                web_search="live", workspace=WorkspaceConfig(cwd=self.project),
+            ),
+            input="NEEDS_REPAIR",
+            validation=ValidationConfig(repair=True),
+        )
+        job.output_validators.append(self._require_repaired_json)
+        response = job.run()
+        self.assertEqual(response.content, '{"ok": true}')
+        self.assertEqual(len(self.thread_prompts), 2)
+        self.assertEqual(len(self.sdk_configs), 1)
+        self.assertIn('web_search="live"', self.sdk_configs[0].config_overrides)
+
+    def test_web_search_reviewer_uses_its_own_session_setting(self):
+        for mode in (None, "live", "cached", "disabled"):
+            with self.subTest(mode=mode):
+                first = len(self.sdk_configs)
+                CodexJob(
+                    config=SessionConfig(
+                        web_search="live", workspace=WorkspaceConfig(cwd=self.project),
+                    ),
+                    input="x",
+                    review=ReviewConfig(
+                        context="REVIEW_SHOULD_PASS",
+                        session=SessionConfig(web_search=mode),
+                    ),
+                ).run()
+                main, reviewer = self.sdk_configs[first:]
+                self.assertIn('web_search="live"', main.config_overrides)
+                self.assertEqual(
+                    [v for v in reviewer.config_overrides if v.startswith("web_search=")],
+                    [] if mode is None else [f'web_search="{mode}"'],
+                )
+
+    def test_web_search_runner_managed_child_and_followup_keep_session_mode(self):
+        parent = SessionConfig(
+            web_search="live", workspace=WorkspaceConfig(cwd=self.project),
+        )
+        for mode in ("live", "cached", "disabled", None):
+            with self.subTest(mode=mode):
+                child = parent.with_overrides(context=())
+                if mode != "live":
+                    child = child.with_overrides(web_search=mode)
+                manager = _DirectChildManager(
+                    parent_config=parent,
+                    config=SubagentConfig(
+                        session=child,
+                        allowed_models={child.model: (child.reasoning_effort,)},
+                    ),
+                )
+                manager.validate_permissions(parent_tools=())
+                manager.activate(timeout=None)
+                first = len(self.sdk_configs)
+                try:
+                    target = manager.spawn_agent("research", "research")["target"]
+                    manager.wait_agent(timeout_ms=3000)
+                    self.assertEqual(manager.list_agents()[0]["status"], "completed")
+                    manager.followup_task(target, "continue research")
+                    manager.wait_agent(timeout_ms=3000)
+                    self.assertEqual(manager.list_agents()[0]["status"], "completed")
+                finally:
+                    manager.close()
+                self.assertEqual(len(self.sdk_configs[first:]), 2)
+                for sdk_config in self.sdk_configs[first:]:
+                    self.assertEqual(
+                        [v for v in sdk_config.config_overrides if v.startswith("web_search=")],
+                        [] if mode is None else [f'web_search="{mode}"'],
+                    )
+
     def test_run_returns_response_content(self):
         client = CodexClient(cwd=str(self.project), context=["README.md"])
 
@@ -404,6 +493,7 @@ class CodexClientTests(unittest.TestCase):
 
     def test_public_session_resume_and_fork_reuse_one_conversation_store(self):
         config = SessionConfig(
+            web_search="live",
             workspace=WorkspaceConfig(cwd=self.project),
         )
         source = CodexSession(config=config, input="ECHO_PROMPT first")
@@ -418,6 +508,9 @@ class CodexClientTests(unittest.TestCase):
         self.assertEqual(first.content, "ECHO_PROMPT first")
         self.assertEqual(continued.content, "ECHO_PROMPT continued")
         self.assertEqual(branch_response.content, "ECHO_PROMPT branched")
+        self.assertEqual(len(self.sdk_configs), 3)
+        for sdk_config in self.sdk_configs:
+            self.assertIn('web_search="live"', sdk_config.config_overrides)
         self.assertEqual(len(self.thread_start_calls), 1)
         self.assertEqual(len(self.sdk_threads), 2)
         self.assertEqual(
@@ -855,6 +948,7 @@ class CodexClientTests(unittest.TestCase):
             name="user_echo",
         )
         config = SessionConfig(
+            web_search="live",
             tools=ToolConfig(tools=(user_tool,)),
             workspace=WorkspaceConfig(cwd=self.project),
         )
@@ -910,6 +1004,7 @@ class CodexClientTests(unittest.TestCase):
                 input="REVIEW_TRIGGER_REPAIR",
                 review=ReviewConfig(
                     context="REVIEW_SHOULD_FAIL_ON_BAD_RESPONSE",
+                    session=SessionConfig(web_search="disabled", allow_shell_commands=False),
                     enable_peer_exchange=True,
                     reuse_session=True,
                 ),
@@ -963,6 +1058,10 @@ class CodexClientTests(unittest.TestCase):
                 fork_config.config_overrides,
             )
         reviewer_to_main_fork, main_to_reviewer_fork = fork_configs
+        self.assertIn('web_search="live"', peer_configs[0].config_overrides)
+        self.assertIn('web_search="disabled"', peer_configs[1].config_overrides)
+        self.assertIn('web_search="live"', reviewer_to_main_fork.config_overrides)
+        self.assertIn('web_search="disabled"', main_to_reviewer_fork.config_overrides)
         self.assertNotIn(
             "features.shell_tool=false",
             reviewer_to_main_fork.config_overrides,
@@ -4013,6 +4112,7 @@ class CodexClientTests(unittest.TestCase):
         artifact = self.project / "recruitment_case.json"
         artifact.write_text('{"company_id": "1"}\n', encoding="utf-8")
         reviewer_session = SessionConfig(
+            web_search="live",
             allow_shell_commands=False,
             workspace=WorkspaceConfig(
                 cwd=self.project,
@@ -4020,14 +4120,7 @@ class CodexClientTests(unittest.TestCase):
                 write_paths=(),
             ),
         )
-        child_session = SessionConfig(
-            allow_shell_commands=False,
-            workspace=WorkspaceConfig(
-                cwd=self.project,
-                read_paths=("${SUBCWD}/.",),
-                write_paths=(),
-            ),
-        )
+        child_session = reviewer_session.with_overrides(context=())
         review = ReviewConfig(
             context="CHECK_REVIEW_CONTEXT",
             session=reviewer_session,
@@ -4044,6 +4137,8 @@ class CodexClientTests(unittest.TestCase):
             )
         )
 
+        self.assertEqual(parent_config.web_search, "live")
+        self.assertEqual(child_config.session.web_search, "live")
         self.assertEqual(parent_config.workspace.read_paths, (artifact,))
         self.assertEqual(child_config.session.workspace.read_paths, (artifact,))
         self.assertEqual(child_config.session.workspace.write_paths, ())
@@ -4082,6 +4177,7 @@ class CodexClientTests(unittest.TestCase):
 
         self.assertEqual(len(_FakeChildJob.configs), 2)
         for config in _FakeChildJob.configs:
+            self.assertEqual(config.web_search, "live")
             self.assertEqual(config.workspace.read_paths, (artifact,))
             self.assertEqual(config.workspace.write_paths, ())
 

@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from ._client_helpers import (
     _normalize_allowed_skills,
     _normalize_optional_reasoning_effort,
+    _normalize_web_search,
 )
 from ._constants import (
     _DEFAULT_MAX_FILE_BYTES,
@@ -215,6 +216,7 @@ class SessionConfig(_Config):
     allow_shell_commands: Any = True
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     tools: ToolConfig | None = None
+    web_search: Any = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -222,6 +224,7 @@ class SessionConfig(_Config):
             "reasoning_effort",
             _normalize_optional_reasoning_effort(self.reasoning_effort),
         )
+        object.__setattr__(self, "web_search", _normalize_web_search(self.web_search))
         object.__setattr__(
             self,
             "codex_bin",
@@ -267,6 +270,7 @@ class SessionConfig(_Config):
             "context": self.context,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "web_search": self.web_search,
             "codex_bin": self.codex_bin,
             "cwd": self.workspace.cwd,
             "subcwd_root": self.workspace.subcwd_root,

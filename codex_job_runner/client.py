@@ -356,6 +356,7 @@ def _initialize_runtime(
     context=None,
     model=_DEFAULT_MODEL,
     reasoning_effort=_DEFAULT_REASONING_EFFORT,
+    web_search=None,
     codex_bin=None,
     cwd=None,
     subcwd_root=None,
@@ -382,6 +383,7 @@ def _initialize_runtime(
     runtime._runtime_reasoning_effort = _normalize_optional_reasoning_effort(
         reasoning_effort
     )
+    runtime._runtime_web_search = _normalize_web_search(web_search)
     runtime._runtime_codex_bin = os.fspath(codex_bin) if codex_bin is not None else None
     runtime._runtime_cwd = cwd
     runtime._runtime_subcwd_root = subcwd_root
@@ -832,6 +834,7 @@ def _start_runtime(
         main_base_config = SessionConfig(
             model=options.model,
             reasoning_effort=options.reasoning_effort,
+            web_search=options.web_search,
             codex_bin=runtime._runtime_codex_bin,
             timeout=options.timeout,
             env=runtime._runtime_env,
@@ -1976,6 +1979,7 @@ def _review_options(runtime, *, review_config, options):
     return _ResolvedOptions(
         model=session_config.model,
         reasoning_effort=session_config.reasoning_effort,
+        web_search=session_config.web_search,
         cwd=(
             session_config.workspace.cwd.expanduser().resolve()
             if session_config.workspace.cwd is not None
@@ -2236,6 +2240,7 @@ def _resolve_options(
         resolved_allow_shell_commands = bool(allow_shell_commands)
     return _ResolvedOptions(
         model=model if model is not None else runtime._runtime_model,
+        web_search=runtime._runtime_web_search,
         reasoning_effort=(
             _normalize_optional_reasoning_effort(reasoning_effort)
             if reasoning_effort is not None
@@ -2258,6 +2263,9 @@ def _resolve_options(
 
 def _runtime_config_overrides(runtime, options, *, include_tools=False):
     overrides = list(_RUNNER_RUNTIME_CONFIG_OVERRIDES)
+    web_search = getattr(options, "web_search", None)
+    if web_search is not None:
+        overrides.append(f"web_search={_toml_string(web_search)}")
     if include_tools and runtime._runtime_tools:
         bridge = _ensure_runtime_tool_bridge(runtime, )
         _append_tool_bridge_override(runtime,

@@ -116,6 +116,7 @@ dependency、priority、retry、意味的な結果統合は扱わない。
 - `CodexSession.fork(input=...)`は履歴を引き継ぐ別threadを作る。
 - threadの保存領域は関連するSessionまたはJobが存在する間だけ保持し、最後の所有objectのGC後に削除する。
 - model、context、timeoutなどSession共通設定は`SessionConfig`へ置く。
+- `SessionConfig.web_search`は`"live"` / `"cached"` / `"disabled"`のみ指定可能。既定の`None`では検索モードのoverrideを追加せず、`with_overrides`で派生したSessionには設定を保持する。
 - Runner管理subagentは`CodexJob.subagents`へ`SubagentConfig`として置き、`SessionConfig`へ再帰的な設定を入れない。
 - 子は汎用`CodexJob`として実行し、生成元の親だけが操作できる。子へsubagent Toolを渡さず、孫は生成しない。
 - 子には`ask_parent(message)`だけを内部公開し、親の`send_message`による回答後に同じturnを再開する。

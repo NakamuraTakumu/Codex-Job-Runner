@@ -2528,6 +2528,14 @@ def _normalize_optional_reasoning_effort(value):
     return text
 
 
+def _normalize_web_search(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in ("live", "cached", "disabled"):
+        raise ValueError("web_search must be None, 'live', 'cached', or 'disabled'")
+    return value
+
+
 def _normalize_allowed_skills(value):
     if value is None:
         return None

@@ -59,6 +59,7 @@ branched = session.fork(input="別案を検討してください。")
 - `CodexSession.resume(...)`：同じ会話を新しいSessionで継続する。
 - `CodexSession.fork(...)`：履歴を分岐した新しいSessionを作る。
 - `SessionConfig(...)`：Session共通の不変な実行設定。
+  `web_search="live" | "cached" | "disabled"`でCodex起動時の検索モードを指定する。既定の`None`はoverrideを追加しない（従来どおり）。
 - `WorkspaceConfig(...)`と`ToolConfig(...)`：workspaceとFunction Toolの設定。
 - `ValidationConfig(...)`、`FileCollectionConfig(...)`、`LoggingConfig(...)`、`SubagentConfig(...)`：Job機能の設定。
 - `CodexJob(...).start()`：pending Jobを起動する。
