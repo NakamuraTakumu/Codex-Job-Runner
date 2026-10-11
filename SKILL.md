@@ -163,6 +163,6 @@ dependency、priority、retry、意味的な結果統合は扱わない。
 ## 検証
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s /home/nakamura/.codex/skills/codex-job-runner/tests
-python3 /home/nakamura/.codex/skills/.system/skill-creator/scripts/quick_validate.py /home/nakamura/.codex/skills/codex-job-runner
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
 ```

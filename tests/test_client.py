@@ -2647,7 +2647,7 @@ class CodexClientTests(unittest.TestCase):
         job.result(timeout=3)
 
     def test_demo_company_analysis_validator_requires_completed_checklist(self):
-        validator = "/home/nakamura/.codex/skills/codex-job-runner/jobs/demo_company_analysis/validate_output.py"
+        validator = str(ROOT / "jobs" / "demo_company_analysis" / "validate_output.py")
         sample = {
             "company_name": "OpenAI",
             "summary": "AI company with strong model and platform position.",
