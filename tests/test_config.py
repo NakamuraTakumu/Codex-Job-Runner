@@ -34,7 +34,7 @@ class ConfigTests(unittest.TestCase):
         first = SessionConfig()
         second = SessionConfig()
 
-        self.assertEqual(first.model, "gpt-5.6-luna")
+        self.assertEqual(first.model, "gpt-6-luna")
         self.assertEqual(first.reasoning_effort, "medium")
         self.assertIsNone(first.web_search)
         self.assertEqual(first.context, ())

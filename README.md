@@ -84,16 +84,16 @@ branched = session.fork(input="別案を検討してください。")
 from codex_job_runner import CodexJob, SessionConfig, SubagentConfig
 
 child = SessionConfig(
-    model="gpt-5.6-luna",
+    model="gpt-6-luna",
     reasoning_effort="medium",
     allow_shell_commands=False,
 )
 job = CodexJob(
-    config=SessionConfig(model="gpt-5.6-luna"),
+    config=SessionConfig(model="gpt-6-luna"),
     input="調査してください。",
     subagents=SubagentConfig(
         session=child,
-        allowed_models={"gpt-5.6-luna": ("low", "medium", "high")},
+        allowed_models={"gpt-6-luna": ("low", "medium", "high")},
         max_concurrent=2,
     ),
 )

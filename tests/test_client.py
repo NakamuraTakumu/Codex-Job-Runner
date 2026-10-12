@@ -3165,7 +3165,7 @@ class CodexClientTests(unittest.TestCase):
         self.assertIn("--model", job.argv)
         self.assertEqual(
             job.argv[job.argv.index("--model") + 1],
-            "gpt-5.6-luna",
+            "gpt-6-luna",
         )
         self.assertIn("--effort", job.argv)
         self.assertEqual(job.argv[job.argv.index("--effort") + 1], "medium")
